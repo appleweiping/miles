@@ -3,9 +3,14 @@ import json
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
-from scripts.tools.verify_session_tito_tokenizer import _print_action_table, _with_session_verify_defaults
+from scripts.tools.verify_session_tito_tokenizer import (
+    _parse_session_verify_args,
+    _print_action_table,
+    _with_session_verify_defaults,
+)
 from tests.e2e.sglang.test_session_server_multi_role import _common
 
 from miles.utils.arguments import parse_args_train_backend
@@ -43,6 +48,7 @@ def _build_args(**overrides) -> str:
         "sglang_mamba_full_memory_ratio": None,
         "sglang_cuda_graph_backend_prefill": None,
         "anthropic_intermediate_system_expectation": None,
+        "ci_tito_special_token_count_threshold": 0.0,
     }
     values.update(overrides)
     return namespace_to_train_args(argparse.Namespace(**values))
@@ -65,6 +71,7 @@ def test_namespace_to_train_args_keeps_ci_test_enabled_for_fsdp_debug_rollout():
 
     assert "--train-backend fsdp" in train_args
     assert "--ci-test" in train_args
+    assert "--no-enable-sample-ownership-checker" in train_args
 
 
 def test_namespace_to_train_args_preserves_resolved_rollout_gpu_count():
@@ -95,6 +102,12 @@ def test_namespace_to_train_args_emits_anthropic_intermediate_system_expectation
     assert "--anthropic-intermediate-system-expectation required" in _build_args(
         anthropic_intermediate_system_expectation="required"
     )
+
+
+def test_namespace_to_train_args_emits_special_token_count_threshold():
+    assert "--ci-tito-special-token-count-threshold" not in _build_args()
+    assert "--ci-tito-special-token-count-threshold" not in _build_args(ci_tito_special_token_count_threshold=0.0)
+    assert "--ci-tito-special-token-count-threshold 0.05" in _build_args(ci_tito_special_token_count_threshold=0.05)
 
 
 def test_namespace_to_train_args_has_no_append_role_policy_flag():
@@ -275,6 +288,7 @@ def test_run_both_versions_adds_v2_anthropic_pass(
     assert [item.rollout_batch_size for item in args] == [8, 8, 8]
     assert [item.global_batch_size for item in args] == [expected_global_batch_size] * 3
     assert [item.assistant_text_threshold for item in args] == expected_thresholds
+    assert [item.ci_tito_special_token_count_threshold for item in args] == [0.0, 0.0, 0.0]
     assert [item.session_message_matcher for item in args] == ["strict", "strict", "loose_tool_call"]
     assert [item.anthropic_intermediate_system_expectation for item in args] == [None, None, "required"]
     assert [item.custom_generate_function_path for item in args] == [
@@ -392,6 +406,43 @@ def test_session_verify_metrics_hard_mismatch_precedes_soft_threshold(tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("hard_types", "threshold", "raises"),
+    [
+        (["special_token_count"], 0.5, False),
+        (["special_token_count"], 0.25, True),
+        (["special_token_count", "special_token_type"], 0.5, True),
+        (["non_assistant_text"], 0.5, True),
+    ],
+)
+def test_session_verify_metrics_special_token_count_threshold(tmp_path, hard_types, threshold, raises):
+    metrics_path = tmp_path / "metrics.jsonl"
+    _write_metrics(
+        metrics_path,
+        [
+            {
+                "driver_events": ["append_tool"],
+                "had_assistant_mismatch": False,
+                "hard_mismatch_count": len(hard_types),
+                "hard_mismatch_types": hard_types,
+                "hard_mismatch_example": {"type": hard_types[0]},
+            },
+            {"driver_events": ["append_tool"], "had_assistant_mismatch": False},
+        ],
+    )
+
+    def check():
+        assert_session_verify_metrics(
+            str(metrics_path), assistant_text_threshold=1.0, special_token_count_threshold=threshold
+        )
+
+    if raises:
+        with pytest.raises(AssertionError, match="hard TITO mismatches"):
+            check()
+    else:
+        check()
+
+
+@pytest.mark.parametrize(
     ("include_clean_sample", "stage", "message", "completed_samples"),
     [
         (True, "anthropic_session_verify_agent.generate", "expected six requests", 1),
@@ -425,6 +476,7 @@ def test_session_verify_metrics_keeps_assistant_text_soft(tmp_path):
 
 @pytest.mark.parametrize("failure_phase", ["execute_train", "post_gate"])
 def test_run_session_verify_preserves_sidecar_on_failure(monkeypatch, tmp_path, failure_phase):
+    """A failed session verification preserves metrics beside the temporary sidecar."""
     metrics_path = tmp_path / "metrics.jsonl"
     metrics_fd = os.open(metrics_path, os.O_CREAT | os.O_RDWR)
     monkeypatch.setattr(session_verify_runner.tempfile, "mkstemp", lambda **kwargs: (metrics_fd, str(metrics_path)))
@@ -435,7 +487,7 @@ def test_run_session_verify_preserves_sidecar_on_failure(monkeypatch, tmp_path, 
     )
     monkeypatch.setattr(session_verify_runner, "_ensure_prompt_data", lambda: None)
     monkeypatch.setattr(session_verify_runner, "_clear_proxy_env", lambda: None)
-    monkeypatch.setattr(session_verify_runner, "_ensure_model_downloaded", lambda checkpoint: checkpoint)
+    monkeypatch.setattr(session_verify_runner, "_ensure_model_downloaded", lambda checkpoint, *, backend: checkpoint)
     monkeypatch.setattr(session_verify_runner, "namespace_to_train_args", lambda args: "train args")
 
     def fake_execute_train(**kwargs):
@@ -445,7 +497,12 @@ def test_run_session_verify_preserves_sidecar_on_failure(monkeypatch, tmp_path, 
         if failure_phase == "execute_train":
             raise subprocess.CalledProcessError(1, "ray job submit")
 
-    monkeypatch.setattr(session_verify_runner.U, "execute_train", fake_execute_train)
+    backend = SimpleNamespace(execute_train=fake_execute_train)
+    monkeypatch.setattr(
+        session_verify_runner.command_utils,
+        "default_config",
+        lambda: SimpleNamespace(create_backend=lambda: backend),
+    )
     args = argparse.Namespace(
         tito_model="qwen3",
         sglang_reasoning_parser="qwen3",
@@ -453,6 +510,7 @@ def test_run_session_verify_preserves_sidecar_on_failure(monkeypatch, tmp_path, 
         hf_checkpoint="/models/test",
         actor_num_gpus_per_node=8,
         assistant_text_threshold=0.2,
+        ci_tito_special_token_count_threshold=0.0,
     )
 
     expected_error = subprocess.CalledProcessError if failure_phase == "execute_train" else AssertionError
@@ -474,3 +532,51 @@ def test_session_verify_env_isolates_anthropic_from_openai_history(wire_format, 
     assert (RECORD_DIR_ENV in env) is disables_history
     if disables_history:
         assert env[RECORD_DIR_ENV] == ""
+
+
+@pytest.mark.parametrize("threshold", [0.2, 0.75])
+def test_cli_parser_adapts_typed_config_to_mutable_runner_namespace(
+    monkeypatch: pytest.MonkeyPatch, threshold: float
+) -> None:
+    """Verifier-only settings stay local while typed engine and custom-hook settings reach the runner."""
+    argv = _with_session_verify_defaults(
+        [
+            "--tito-model",
+            "qwen3",
+            "--actor-num-gpus-per-node",
+            "1",
+            "--rollout-num-gpus-per-engine",
+            "1",
+            "--rollout-batch-size",
+            "2",
+            "--session-verify-cycles",
+            "2",
+            "--tool-call-failure-mode",
+            "append_user",
+            "--no-enable-sample-ownership-checker",
+            "--assistant-text-threshold",
+            str(threshold),
+            "--sglang-reasoning-parser",
+            "qwen3",
+            "--sglang-tool-call-parser",
+            "qwen25",
+        ]
+    )
+    monkeypatch.setattr(sys, "argv", ["verify_session_tito_tokenizer.py", *argv])
+    args = _parse_session_verify_args()
+
+    assert args.assistant_text_threshold == threshold
+    assert args.enable_sample_ownership_checker is False
+    assert args.rollout_batch_size == 2
+    assert args.session_verify_cycles == 2
+    assert args.tool_call_failure_mode == "append_user"
+    args.hf_checkpoint = "/root/models/local"
+    args.sglang_reasoning_parser = "qwen3"
+    train_args = namespace_to_train_args(args)
+    assert "--hf-checkpoint /root/models/local" in train_args
+    assert "--session-verify-cycles 2" in train_args
+    assert "--tool-call-failure-mode append_user" in train_args
+    assert "--sglang-reasoning-parser qwen3" in train_args
+    assert "--no-enable-sample-ownership-checker" in train_args
+    assert "assistant-text-threshold" not in train_args
+    assert "enable-spec" not in train_args

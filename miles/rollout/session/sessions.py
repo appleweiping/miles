@@ -9,6 +9,7 @@ import logging
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionResponse
 from sglang.srt.parser.template_detection import detect_inline_system_support
 from starlette.responses import Response
@@ -43,6 +44,7 @@ from miles.rollout.session.config import SessionServerConfig
 from miles.rollout.session.core import JSON_MEDIA_TYPE, SessionCore, _render_json
 from miles.rollout.session.errors import SessionError
 from miles.rollout.session.linear_trajectory import SessionRegistry
+from miles.rollout.session.types import CreateSessionRequest
 from miles.utils.chat_template_utils import get_tito_tokenizer
 from miles.utils.chat_template_utils.message_matcher_hub import (
     SessionMessageMatcherError,
@@ -71,7 +73,9 @@ def setup_session_routes(app, backend, config: SessionServerConfig, *, use_addit
         tokenizer_type=config.tito_model,
         chat_template_kwargs=config.apply_chat_template_kwargs,
     )
-    merge_inline_system = not detect_inline_system_support(getattr(tokenizer, "chat_template", None))
+    merge_inline_system = not detect_inline_system_support(
+        getattr(tokenizer, "chat_template", None)
+    )  # config-access-exempt: custom tokenizers may omit a chat template
 
     use_v2 = config.use_session_server == "v2"
     if use_v2:
@@ -100,8 +104,16 @@ def setup_session_routes(app, backend, config: SessionServerConfig, *, use_addit
         return Response(content=_render_json(body), status_code=response.status_code, media_type=JSON_MEDIA_TYPE)
 
     @app.post("/sessions")
-    async def create_session():
-        return await core.create_session()
+    async def create_session(request: Request):
+        try:
+            params = CreateSessionRequest.model_validate_json(await request.body() or b"{}")
+        except ValidationError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+        return await core.create_session(
+            evaluation=params.evaluation,
+            sampling_defaults=params.model_dump(exclude={"evaluation", "extra_key"}, exclude_none=True),
+            extra_key=params.extra_key,
+        )
 
     @app.get("/sessions/{session_id}")
     async def get_session(session_id: str):
@@ -236,3 +248,5 @@ def setup_session_routes(app, backend, config: SessionServerConfig, *, use_addit
             headers=dict(request.headers),
             body=body,
         )
+
+    return core

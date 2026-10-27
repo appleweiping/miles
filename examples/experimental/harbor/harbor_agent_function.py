@@ -43,14 +43,14 @@ Env vars (read on the rollout worker):
   AGENT_MAX_INPUT_TOKENS / AGENT_MAX_OUTPUT_TOKENS, HARBOR_MAX_SEQ_LEN,
   HARBOR_AGENT_MAX_ITERATIONS, HARBOR_RESPONSE_LENGTH_POLICY,
   HARBOR_TERMINUS_2_ENABLE_SUMMARIZE, HARBOR_TERMINUS_2_LINEAR_HISTORY,
-  HARBOR_OVERRIDE_MEMORY_MB, HARBOR_TIMEOUT_MULTIPLIER,
+  HARBOR_OVERRIDE_CPUS, HARBOR_OVERRIDE_MEMORY_MB,
+  HARBOR_CPU_ENFORCEMENT_POLICY, HARBOR_MEMORY_ENFORCEMENT_POLICY,
+  HARBOR_TIMEOUT_MULTIPLIER,
   HARBOR_VERIFIER_TIMEOUT_SEC, HARBOR_ENV_BUILD_TIMEOUT_MULTIPLIER,
   HARBOR_AGENT_ALLOWED_HOSTS
                          same meaning as on the agent server
-  MILES_ROUTER_EXTERNAL_HOST
-                         host the sandbox uses to reach the session server
-                         (in-sandbox agents call the model from inside the
-                         sandbox, so it must route from the sandbox platform)
+  HARBOR_OVERRIDE_STORAGE_MB
+                         per-sandbox disk, Harbor's ``override_storage_mb``
 
 Failure semantics: a verdict is returned as-is; every episode that ends
 without one scores 0 with a named ``exit_status`` (``TimeLimitExceeded``,
@@ -65,6 +65,7 @@ contract lands.
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 from collections.abc import Callable
@@ -73,7 +74,7 @@ from pathlib import Path
 from typing import Any
 
 from miles.rollout.agentic.credentials import PROVIDER_CREDENTIALS, resolve_provider_api_key
-from miles.rollout.agentic.session import resolve_session_url
+from miles.rollout.agentic.session import openai_session_url
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,11 @@ _SAFE_INSTANCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 # Harbor exception class names -> the exit_status vocabulary the reward path reads.
 _TIMEOUT_EXCEPTIONS = {"AgentTimeoutError", "VerifierTimeoutError", "EnvironmentStartTimeoutError"}
 _OUTPUT_LIMIT_EXCEPTIONS = {"MaxSeqLenExceededError", "SingleTurnMaxSeqLenExceededError"}
+
+
+def _trial_timeout_s() -> int:
+    """The wall-clock cap run() puts on one trial; the longest a trial can live."""
+    return int(os.environ.get("AGENT_TRIAL_TIMEOUT", _DEFAULT_AGENT_TRIAL_TIMEOUT_S))
 
 
 def _env_flag(var: str) -> bool:
@@ -301,10 +307,35 @@ def _environment_config():
         raise ValueError("set HARBOR_ENV_TYPE to the Harbor environment type to run trials on (e.g. e2b, daytona)")
     env_type = EnvironmentType(raw)  # raises on an unknown backend instead of guessing
     kwargs = json.loads(os.getenv("HARBOR_ENV_KWARGS", "{}") or "{}")
-    override_memory_mb = _env_int("HARBOR_OVERRIDE_MEMORY_MB")
-    if override_memory_mb is not None and override_memory_mb <= 0:
-        raise ValueError("HARBOR_OVERRIDE_MEMORY_MB must be a positive integer")
-    return EnvironmentConfig(type=env_type, delete=True, override_memory_mb=override_memory_mb, kwargs=kwargs)
+    if env_type == EnvironmentType.DAYTONA:
+        # a killed worker never reaches Harbor's teardown, and Harbor's Daytona defaults (0) never reclaim;
+        # the stop timer outlasts the trial cap because an in-sandbox agent looks idle to Daytona
+        trial_min = math.ceil(_trial_timeout_s() / 60)
+        kwargs.setdefault("auto_stop_interval_mins", trial_min + 30)
+        kwargs.setdefault("auto_delete_interval_mins", 1440)
+        if int(kwargs["auto_stop_interval_mins"]) <= trial_min:
+            raise ValueError(
+                f"auto_stop_interval_mins={kwargs['auto_stop_interval_mins']} would stop a Daytona sandbox "
+                f"mid-trial: AGENT_TRIAL_TIMEOUT allows {trial_min} minutes"
+            )
+    overrides = {}
+    for field, var in (
+        ("override_cpus", "HARBOR_OVERRIDE_CPUS"),
+        ("override_memory_mb", "HARBOR_OVERRIDE_MEMORY_MB"),
+        ("override_storage_mb", "HARBOR_OVERRIDE_STORAGE_MB"),
+    ):
+        value = _env_int(var)
+        if value is not None and value <= 0:
+            raise ValueError(f"{var} must be a positive integer")
+        overrides[field] = value
+    policies = {}
+    for field, var in (
+        ("cpu_enforcement_policy", "HARBOR_CPU_ENFORCEMENT_POLICY"),
+        ("memory_enforcement_policy", "HARBOR_MEMORY_ENFORCEMENT_POLICY"),
+    ):
+        if value := os.getenv(var, "").strip():
+            policies[field] = value
+    return EnvironmentConfig(type=env_type, delete=True, kwargs=kwargs, **overrides, **policies)
 
 
 def build_trial_config(metadata: dict[str, Any], session_url: str, request_kwargs: dict[str, Any]):
@@ -356,47 +387,77 @@ def build_trial_config(metadata: dict[str, Any], session_url: str, request_kwarg
 
 
 def _timing_duration_sec(timing) -> float | None:
-    started = getattr(timing, "started_at", None)
-    finished = getattr(timing, "finished_at", None)
+    started = getattr(
+        timing, "started_at", None
+    )  # config-access-exempt: unfinished Harbor trial phases may have no start timestamp
+    finished = getattr(
+        timing, "finished_at", None
+    )  # config-access-exempt: unfinished Harbor trial phases may have no finish timestamp
     return (finished - started).total_seconds() if started and finished else None
 
 
 def trial_result_to_metadata(result) -> dict[str, Any]:
     """Harbor ``TrialResult`` -> the dict merged into sample metadata."""
-    exc = getattr(result, "exception_info", None)
+    exc = getattr(
+        result, "exception_info", None
+    )  # config-access-exempt: Harbor results without an exception omit exception details
     if exc is not None:
-        exc_type = getattr(exc, "exception_type", "")
+        exc_type = getattr(
+            exc, "exception_type", ""
+        )  # config-access-exempt: partial Harbor exception records may lack the exception type
         if exc_type in _TIMEOUT_EXCEPTIONS:
             exit_status = "TimeLimitExceeded"
         elif exc_type in _OUTPUT_LIMIT_EXCEPTIONS:
             exit_status = "SequenceLengthLimitExceeded"
         else:
             exit_status = "AgentError"
-    elif getattr(result, "verifier_result", None) is not None:
+    elif (
+        getattr(result, "verifier_result", None) is not None
+    ):  # config-access-exempt: failed Harbor trials may not produce verifier results
         exit_status = "Submitted"
     else:
         exit_status = "AgentError"
 
-    verifier = getattr(result, "verifier_result", None)
-    rewards = dict(getattr(verifier, "rewards", None) or {}) if verifier is not None else {}
+    verifier = getattr(
+        result, "verifier_result", None
+    )  # config-access-exempt: failed Harbor trials may not produce verifier results
+    rewards = (
+        dict(getattr(verifier, "rewards", None) or {}) if verifier is not None else {}
+    )  # config-access-exempt: Harbor verifier results may omit rewards before grading completes
     reward = float(rewards.get("reward", next(iter(rewards.values()), 0.0))) if rewards else 0.0
 
     metrics: dict[str, Any] = {}
-    agent_result = getattr(result, "agent_result", None)
+    agent_result = getattr(
+        result, "agent_result", None
+    )  # config-access-exempt: Harbor trials failing before agent execution have no agent result
     if agent_result is not None:
         for field in ("n_input_tokens", "n_output_tokens", "cost_usd"):
-            if (value := getattr(agent_result, field, None)) is not None:
+            if (
+                value := getattr(agent_result, field, None)
+            ) is not None:  # config-access-exempt: Harbor agent implementations expose different optional token and cost metrics
                 metrics[field] = value
-        if (n_steps := getattr(agent_result, "n_steps", None)) is not None:
+        if (
+            n_steps := getattr(agent_result, "n_steps", None)
+        ) is not None:  # config-access-exempt: Harbor agent results do not all report a step count
             metrics["turns"] = n_steps
-        if isinstance(agent_meta := getattr(agent_result, "metadata", None), dict):
+        if isinstance(
+            agent_meta := getattr(agent_result, "metadata", None), dict
+        ):  # config-access-exempt: Harbor agent-specific metadata is optional
             metrics.update(agent_meta)
     for key, timing in {
         "total_time": result,
-        "env_setup_time": getattr(result, "environment_setup", None),
-        "agent_setup_time": getattr(result, "agent_setup", None),
-        "agent_run_time": getattr(result, "agent_execution", None),
-        "eval_time": getattr(result, "verifier", None),
+        "env_setup_time": getattr(
+            result, "environment_setup", None
+        ),  # config-access-exempt: Harbor results may omit timings for phases that did not run
+        "agent_setup_time": getattr(
+            result, "agent_setup", None
+        ),  # config-access-exempt: Harbor results may omit timings for phases that did not run
+        "agent_run_time": getattr(
+            result, "agent_execution", None
+        ),  # config-access-exempt: Harbor results may omit timings for phases that did not run
+        "eval_time": getattr(
+            result, "verifier", None
+        ),  # config-access-exempt: Harbor results may omit timings for phases that did not run
     }.items():
         if timing is not None and (duration := _timing_duration_sec(timing)) is not None:
             metrics[key] = duration
@@ -423,9 +484,9 @@ async def run(
 
     metadata = metadata or {}
     request_kwargs = request_kwargs or {}
-    session_url = resolve_session_url(base_url)
+    session_url = openai_session_url(base_url)
     instance_id = metadata.get("instance_id")
-    trial_timeout_s = int(os.environ.get("AGENT_TRIAL_TIMEOUT", _DEFAULT_AGENT_TRIAL_TIMEOUT_S))
+    trial_timeout_s = _trial_timeout_s()
 
     # Config errors (missing task dir, bad env vars, unresolvable provider key)
     # fail every sample the same way; raising beats training on silent all-zero

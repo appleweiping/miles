@@ -1,4 +1,6 @@
+import numpy as np
 import pytest
+from huggingface_hub import snapshot_download
 from openai.types.chat import ChatCompletionMessageToolCall
 from sglang.srt.function_call.core_types import ToolCallItem
 
@@ -8,8 +10,11 @@ from miles.rollout.generate_utils.tool_call_utils import (
     _execute_tool_call,
     execute_tool_calls,
     tokenize_tool_responses,
+    update_sample_with_tool_responses,
 )
 from miles.utils.processing_utils import load_tokenizer
+from miles.utils.sampling_mask import RolloutSamplingMask
+from miles.utils.types import Sample
 
 TOOL_CALL_TEST_MODELS = [
     "Qwen/Qwen2.5-0.5B-Instruct",
@@ -19,7 +24,7 @@ TOOL_CALL_TEST_MODELS = [
     "Qwen/Qwen3.5-0.8B",
     "Qwen/Qwen3-Coder-Next",
     # "meta-llama/Llama-3.2-1B-Instruct",  # Skipped: gated repo, requires HF_TOKEN in CI
-    "mistralai/Mistral-7B-Instruct-v0.3",
+    # "mistralai/Mistral-7B-Instruct-v0.3",  # Disabled: legacy model; HF CDN returns 403 for its tokenizer.model
     "MiniMaxAI/MiniMax-M2.5",
     "MiniMaxAI/MiniMax-M2.7",
     "internlm/internlm3-8b-instruct",
@@ -144,6 +149,48 @@ async def test_invalid_arguments_do_not_skip_later_tool_calls():
     ]
 
 
+@pytest.mark.parametrize("arguments", ["{", '{"cmd": "pytest"}'])
+async def test_tool_responses_preserve_sampling_metadata(arguments):
+    calls = []
+
+    async def execute_one(name, params):
+        calls.append((name, params))
+        return "ok"
+
+    messages = await execute_tool_calls([ToolCallItem(tool_index=0, name="bash", parameters=arguments)], execute_one)
+    assert calls == ([] if arguments == "{" else [("bash", {"cmd": "pytest"})])
+
+    tokenizer = load_tokenizer("Qwen/Qwen3-0.6B", trust_remote_code=True)
+    appended_ids = tokenize_tool_responses(messages, tokenizer)
+    assert appended_ids
+    sample = Sample(
+        tokens=[1, 2],
+        response="existing",
+        response_length=1,
+        loss_mask=[1],
+        rollout_log_probs=[-0.25],
+        rollout_topk_token_ids=np.array([[2, 3]], dtype=np.int32),
+        rollout_topk_log_probs=np.array([[-0.25, -1.5]], dtype=np.float32),
+        rollout_sampling_mask=RolloutSamplingMask.from_mask_list([[2, 3]]),
+    )
+
+    update_sample_with_tool_responses(sample, messages, tokenizer)
+
+    sample.validate()
+    assert sample.tokens == [1, 2] + appended_ids
+    assert sample.response == "existing" + tokenizer.decode(appended_ids)
+    assert sample.response_length == 1 + len(appended_ids)
+    assert sample.loss_mask == [1] + [0] * len(appended_ids)
+    assert sample.rollout_log_probs == [-0.25] + [0.0] * len(appended_ids)
+    np.testing.assert_array_equal(sample.rollout_topk_token_ids[0], [2, 3])
+    np.testing.assert_array_equal(sample.rollout_topk_log_probs[0], [-0.25, -1.5])
+    assert np.all(sample.rollout_topk_token_ids[1:] == -1)
+    assert np.all(np.isneginf(sample.rollout_topk_log_probs[1:]))
+    mask_ids, mask_offsets = sample.rollout_sampling_mask._as_tensors()
+    assert mask_ids.tolist() == [2, 3] + appended_ids
+    assert mask_offsets.tolist() == [0, 2] + list(range(3, len(appended_ids) + 3))
+
+
 class TestTokenizeToolResponses:
     @pytest.mark.parametrize("model_name", ["Qwen/Qwen3-0.6B"])
     def test_snapshot(self, model_name):
@@ -168,7 +215,21 @@ class TestTokenizeToolResponses:
         if num_tools > 1 and model_name in SINGLE_TOOL_CALL_ONLY_MODELS:
             pytest.skip(f"{model_name} only supports single tool call")
 
-        tokenizer = load_tokenizer(model_name, trust_remote_code=True)
+        tokenizer_path = model_name
+        if model_name == "mistralai/Mistral-7B-Instruct-v0.3":
+            tokenizer_path = snapshot_download(
+                repo_id=model_name,
+                allow_patterns=[
+                    "config.json",
+                    "tokenizer.json",
+                    "tokenizer_config.json",
+                    "special_tokens_map.json",
+                    "added_tokens.json",
+                    "chat_template.jinja",
+                    "chat_templates/*.jinja",
+                ],
+            )
+        tokenizer = load_tokenizer(tokenizer_path, trust_remote_code=True)
 
         tool_responses = SAMPLE_TOOL_RESPONSES[:num_tools]
         assert len(tool_responses) == num_tools

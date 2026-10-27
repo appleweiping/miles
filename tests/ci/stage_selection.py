@@ -19,6 +19,7 @@ PR_GPU_STAGES = frozenset(
         "stage-c-4-gpu-h200",
         "stage-c-8-gpu-h100",
         "stage-c-8-gpu-h200",
+        "stage-c-4-gpu-b200",
         "stage-c-8-gpu-b200",
         "stage-c-4-gpu-mi350",
     }
@@ -30,7 +31,7 @@ _BROAD_PR_SCOPES = frozenset({"nightly", "run-ci-all", "run-ci-image", "run-ci-b
 # Keep this allowlist to paths proven not to affect GPU runtime. Every
 # unmatched path deliberately fans out to all local GPU stages.
 _NO_GPU_PATHS = frozenset({".pre-commit-config.yaml", "scripts/tools/sync_example_docs.py"})
-_NO_GPU_PREFIXES = ("docs/",)
+_NO_GPU_PREFIXES = ("docs/", ".claude/")
 _NO_GPU_SUFFIXES = (".md", ".mdx")
 _STATUS = re.compile(r"^(?:[ADMTUXB]|[RC][0-9]{1,3})$")
 
@@ -134,7 +135,7 @@ def _explicit_scope_stages(
     return stages
 
 
-def _known_no_gpu_path(path: str) -> bool:
+def known_no_gpu_path(path: str) -> bool:
     return path in _NO_GPU_PATHS or path.startswith(_NO_GPU_PREFIXES) or path.endswith(_NO_GPU_SUFFIXES)
 
 
@@ -156,7 +157,7 @@ def _affected_stages(
         for path in changed_file.paths:
             if path in registered_files:
                 affected.update(stages_by_file.get(path, ()))
-            elif _known_no_gpu_path(path):
+            elif known_no_gpu_path(path):
                 continue
             else:
                 return set(PR_GPU_STAGES)
@@ -172,11 +173,13 @@ def select_skipped_gpu_stages(
     raw_labels: Iterable[str],
 ) -> tuple[str, ...]:
     """Return local GPU stage IDs that a workflow can safely skip."""
-    if event_name != "pull_request" or changed_files is None:
+    if event_name != "pull_request":
         return ()
 
     registrations = tuple(registrations)
     runnable = _runnable_stages(registrations, run_policy)
+    if changed_files is None:
+        return tuple(sorted(PR_GPU_STAGES - runnable))
     affected = _affected_stages(changed_files, registrations, run_policy)
     affected.update(_explicit_scope_stages(registrations, run_policy, raw_labels, runnable))
     return tuple(sorted(PR_GPU_STAGES - (runnable & affected)))

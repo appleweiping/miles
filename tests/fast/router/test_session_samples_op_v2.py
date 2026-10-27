@@ -51,7 +51,7 @@ _ARGS = make_session_server_config(
     sglang_speculative_algorithm=None,
     instance_id=uuid.uuid4().hex,
     save_debug_trajectory_data=None,
-    session_sample_picker_path="miles.rollout.session.v2.picker_hub.drop_retries",
+    session_sample_picker_path="miles.rollout.session.v2.picker_hub.drop_rolled_back_leaves",
     session_sample_postprocessor_path="miles.rollout.session.v2.postprocessor_hub.default_postprocess",
     num_layers=NUM_LAYERS,
     moe_router_topk=TOPK,
@@ -88,6 +88,15 @@ def core():
 @pytest.fixture(scope="module")
 def addition_core():
     return _build_core(use_addition_r3=True)
+
+
+@pytest.fixture(scope="module")
+def same_prompt_core():
+    return _build_core(
+        _ARGS.model_copy(
+            update={"session_sample_picker_path": "miles.rollout.session.v2.picker_hub.drop_same_prompt_retries"}
+        )
+    )
 
 
 @pytest.fixture(scope="module")
@@ -154,10 +163,11 @@ async def _make_session(core, records, accumulated) -> str:
     response = await core.create_session()
     sid = json.loads(response.body)["session_id"]
     state = core.registry.sessions[sid]
+    parent = None
     for i, record in enumerate(records):
         last = i == len(records) - 1
-        state.active_leaf = state.tree.create_node(
-            state.active_leaf,
+        parent = state.tree.create_node(
+            parent,
             delta_messages=[],
             token_ids=list(accumulated) if (last and accumulated is not None) else [],
             completion_span=(0, 0),
@@ -205,8 +215,12 @@ async def test_assembled_samples_golden_merged(core):
     assert m.rollout_log_probs == [-0.125, -0.25, 0.0, 0.0, -0.5, -1.0]
     assert m.status == Sample.Status.COMPLETED
     assert m.weight_versions == [
-        WeightVersionsPerCall(spans=[WeightVersionSpan(version="w1", abs_start=3, abs_end=5)]),
-        WeightVersionsPerCall(spans=[WeightVersionSpan(version="w2", abs_start=7, abs_end=9)]),
+        WeightVersionsPerCall(
+            spans=[WeightVersionSpan(version="w1", abs_start=3, abs_end=5)], output_start=3, prompt_tokens=3
+        ),
+        WeightVersionsPerCall(
+            spans=[WeightVersionSpan(version="w2", abs_start=7, abs_end=9)], output_start=7, prompt_tokens=7
+        ),
     ]
     assert np.array_equal(m.rollout_routed_experts, _expected_r3(100, 8))
     assert m.prefix_cache_info.to_dict() == {"cached_tokens": 5, "total_prompt_tokens": 10}
@@ -260,6 +274,42 @@ async def test_session_rollout_metrics_are_absent_when_spec_is_disabled(core):
 
     assert sample.spec_info == Sample.SpecInfo()
     assert SESSION_ROLLOUT_METRICS_KEY not in reply.session_metadata
+
+
+async def test_assembled_sample_carries_prefill_spans_per_turn(core):
+    """Each turn's prompt KV versions land on that turn's call in absolute coordinates, starting at token 0."""
+    records = _two_turn_records()
+    records[0].response["choices"][0]["meta_info"]["prefill_weight_versions"] = [
+        {"version": "w1", "start": 0, "end": 3}
+    ]
+    records[1].response["choices"][0]["meta_info"]["prefill_weight_versions"] = [
+        {"version": "w1", "start": 0, "end": 5},
+        {"version": "w2", "start": 5, "end": 7},
+    ]
+    sid = await _make_session(core, records, _ACCUMULATED)
+    status, payload = await _collect_via_op(core, sid, agent_metadata=_AGENT_METADATA)
+    assert status == 200
+    samples, _ = _new_pipeline(payload, _input_sample())
+    (m,) = samples
+
+    assert m.weight_versions == [
+        WeightVersionsPerCall(
+            spans=[WeightVersionSpan(version="w1", abs_start=3, abs_end=5)],
+            prefill_spans=[WeightVersionSpan(version="w1", abs_start=0, abs_end=3)],
+            output_start=3,
+            prompt_tokens=3,
+        ),
+        WeightVersionsPerCall(
+            spans=[WeightVersionSpan(version="w2", abs_start=7, abs_end=9)],
+            prefill_spans=[
+                WeightVersionSpan(version="w1", abs_start=0, abs_end=5),
+                WeightVersionSpan(version="w2", abs_start=5, abs_end=7),
+            ],
+            output_start=7,
+            prompt_tokens=7,
+        ),
+    ]
+    m.validate()
 
 
 async def test_truncation_golden(core):
@@ -380,7 +430,6 @@ async def test_addition_branched_tree_materializes_each_leaf():
             [1, 2, 3, 10, 11, 21, 31],
             completion_span=(6, 7),
         )
-        state.active_leaf = leaf_b
 
         status, payload = await _collect_via_op(hooked, sid)
         assert status == 200
@@ -481,8 +530,8 @@ async def _fresh_state(core):
     return sid, core.registry.sessions[sid]
 
 
-async def test_superseded_retry_leaf_is_trimmed(core):
-    """A childless leaf with a later sibling is retry noise: one sample out."""
+async def test_rolled_back_leaf_is_trimmed(core):
+    """A childless leaf with a later sibling is trimmed whatever it re-sent: one sample out."""
     sid, state = await _fresh_state(core)
     root = _fabricate_node(
         state, None, _single_turn_record([1, 2, 3], [10, 11]), [1, 2, 3, 10, 11], completion_span=(3, 5)
@@ -494,14 +543,13 @@ async def test_superseded_retry_leaf_is_trimmed(core):
         [1, 2, 3, 10, 11, 20, 30],
         completion_span=(6, 7),
     )
-    retry = _fabricate_node(  # the retry that superseded it
+    _fabricate_node(  # the different request that superseded it
         state,
         root,
         _single_turn_record([1, 2, 3, 10, 11, 21], [31]),
         [1, 2, 3, 10, 11, 21, 31],
         completion_span=(6, 7),
     )
-    state.active_leaf = retry
 
     status, payload = await _collect_via_op(core, sid)
     assert status == 200
@@ -541,7 +589,6 @@ async def test_deep_abandoned_branch_survives_and_masks_shared_prefix(core, traj
         completion_span=(6, 7),
         response_id="late",
     )
-    state.active_leaf = late_leaf
 
     status, payload = await _collect_via_op(core, sid, agent_metadata={"reward": trajectory_reward})
     assert status == 200
@@ -612,7 +659,6 @@ async def test_session_rollout_metrics_count_every_tree_node_once(spec_core):
         completion_span=(6, 7),
         response_id="late",
     )
-    state.active_leaf = late_leaf
 
     status, payload = await _collect_via_op(spec_core, sid)
     assert status == 200
@@ -685,28 +731,27 @@ async def test_picker_warns_and_trims_longer_superseded_leaf(core, caplog):
     root = _fabricate_node(
         state, None, _single_turn_record([1, 2, 3], [10, 11]), [1, 2, 3, 10, 11], completion_span=(3, 5)
     )
-    _fabricate_node(  # abandoned but LONGER than the retry
+    _fabricate_node(  # abandoned but LONGER than its replacement
         state,
         root,
         _single_turn_record([1, 2, 3, 10, 11, 20], [30, 31, 32]),
         [1, 2, 3, 10, 11, 20, 30, 31, 32],
         completion_span=(6, 9),
     )
-    retry = _fabricate_node(
+    replacement = _fabricate_node(
         state,
         root,
         _single_turn_record([1, 2, 3, 10, 11, 21], [31]),
         [1, 2, 3, 10, 11, 21, 31],
         completion_span=(6, 7),
     )
-    state.active_leaf = retry
 
-    with caplog.at_level(logging.WARNING, logger="miles.rollout.session.v2.picker_hub.drop_retries"):
+    with caplog.at_level(logging.WARNING, logger="miles.rollout.session.v2.picker_hub.drop_rolled_back_leaves"):
         status, payload = await _collect_via_op(core, sid)
     assert status == 200
     reply = decode_samples_and_merge_input_sample(payload, Sample(), fields=COMPUTED_FIELDS_V2)
     (sample,) = reply.samples
-    assert sample.tokens == retry.token_ids
+    assert sample.tokens == replacement.token_ids
     assert "longer than every later sibling's deepest leaf" in caplog.text
     assert "continuing by seq" in caplog.text
 
@@ -725,7 +770,7 @@ async def test_picker_warns_on_wall_clock_rollback_and_trims_by_seq(core, caplog
         completion_span=(6, 7),
         committed_at=10.0,
     )
-    retry = _fabricate_node(
+    replacement = _fabricate_node(
         state,
         root,
         _single_turn_record([1, 2, 3, 10, 11, 21], [31]),
@@ -733,14 +778,13 @@ async def test_picker_warns_on_wall_clock_rollback_and_trims_by_seq(core, caplog
         completion_span=(6, 7),
         committed_at=5.0,
     )
-    state.active_leaf = retry
 
-    with caplog.at_level(logging.WARNING, logger="miles.rollout.session.v2.picker_hub.drop_retries"):
+    with caplog.at_level(logging.WARNING, logger="miles.rollout.session.v2.picker_hub.drop_rolled_back_leaves"):
         status, payload = await _collect_via_op(core, sid)
     assert status == 200
     reply = decode_samples_and_merge_input_sample(payload, Sample(), fields=COMPUTED_FIELDS_V2)
     (sample,) = reply.samples
-    assert sample.tokens == retry.token_ids
+    assert sample.tokens == replacement.token_ids
     assert "wall-clock rollback" in caplog.text
     assert "continuing by seq" in caplog.text
     assert "longer than every later sibling" not in caplog.text
@@ -753,7 +797,6 @@ async def test_two_roots_yield_two_samples(core):
         state, None, _single_turn_record([1, 2, 3], [10, 11]), [1, 2, 3, 10, 11], completion_span=(3, 5)
     )
     sub = _fabricate_node(state, None, _single_turn_record([7, 8], [70, 71]), [7, 8, 70, 71], completion_span=(2, 4))
-    state.active_leaf = sub
 
     status, payload = await _collect_via_op(core, sid)
     assert status == 200
@@ -765,6 +808,81 @@ async def test_two_roots_yield_two_samples(core):
     assert [n["parent"] for n in tree["nodes"]] == [None, None]
     assert [leaf["node_id"] for leaf in tree["leaves"]] == [main.seq, sub.seq]
     assert [first.reward, second.reward] == [None, None]
+
+
+async def test_each_leaf_path_mismatch_is_computed_once(core, monkeypatch):
+    """The latest generation is a leaf, so its sample reuses the session metadata's mismatch
+    instead of re-rendering and re-tokenizing the same path."""
+    sid, state = await _fresh_state(core)
+    _fabricate_node(state, None, _single_turn_record([1, 2, 3], [10, 11]), [1, 2, 3, 10, 11], completion_span=(3, 5))
+    _fabricate_node(state, None, _single_turn_record([7, 8], [70, 71]), [7, 8, 70, 71], completion_span=(2, 4))
+    rendered_paths = []
+    compute_mismatch = core.registry.compute_mismatch
+
+    def recording_compute_mismatch(messages, token_ids, *, turn_args):
+        rendered_paths.append(list(token_ids))
+        return compute_mismatch(messages, token_ids, turn_args=turn_args)
+
+    monkeypatch.setattr(core.registry, "compute_mismatch", recording_compute_mismatch)
+
+    status, _ = await _collect_via_op(core, sid)
+
+    assert status == 200
+    assert sorted(rendered_paths) == [[1, 2, 3, 10, 11], [7, 8, 70, 71]]
+
+
+@pytest.mark.parametrize("core_name", ["core", "same_prompt_core"])
+async def test_resent_first_turn_root_is_trimmed(core_name, request):
+    """A re-sent first turn opens a root with the same prompt; both pickers trim the abandoned root."""
+    core = request.getfixturevalue(core_name)
+    sid, state = await _fresh_state(core)
+    _fabricate_node(state, None, _single_turn_record([1, 2, 3], [10, 11]), [1, 2, 3, 10, 11], completion_span=(3, 5))
+    retry = _fabricate_node(state, None, _single_turn_record([1, 2, 3], [12]), [1, 2, 3, 12], completion_span=(3, 4))
+    leaf = _fabricate_node(
+        state, retry, _single_turn_record([1, 2, 3, 12, 20], [30]), [1, 2, 3, 12, 20, 30], completion_span=(5, 6)
+    )
+
+    status, payload = await _collect_via_op(core, sid)
+    assert status == 200
+    reply = decode_samples_and_merge_input_sample(payload, Sample(), fields=COMPUTED_FIELDS_V2)
+    (sample,) = reply.samples
+    assert sample.tokens == leaf.token_ids
+
+
+@pytest.mark.parametrize(
+    ("resent_env_token", "expected_leaf_names"),
+    [(20, ["later"]), (21, ["later", "earlier"])],
+    ids=["identical-resend-trimmed", "different-request-kept-as-branch"],
+)
+async def test_same_prompt_picker_trims_only_identical_resends(
+    same_prompt_core, resent_env_token, expected_leaf_names
+):
+    """The default picker supersedes a leaf only when the later sibling re-sent its exact prompt."""
+    sid, state = await _fresh_state(same_prompt_core)
+    root = _fabricate_node(
+        state, None, _single_turn_record([1, 2, 3], [10, 11]), [1, 2, 3, 10, 11], completion_span=(3, 5)
+    )
+    leaves = {
+        "earlier": _fabricate_node(
+            state,
+            root,
+            _single_turn_record([1, 2, 3, 10, 11, 20], [30]),
+            [1, 2, 3, 10, 11, 20, 30],
+            completion_span=(6, 7),
+        ),
+        "later": _fabricate_node(
+            state,
+            root,
+            _single_turn_record([1, 2, 3, 10, 11, resent_env_token], [31]),
+            [1, 2, 3, 10, 11, resent_env_token, 31],
+            completion_span=(6, 7),
+        ),
+    }
+
+    status, payload = await _collect_via_op(same_prompt_core, sid)
+    assert status == 200
+    reply = decode_samples_and_merge_input_sample(payload, Sample(), fields=COMPUTED_FIELDS_V2)
+    assert [sample.tokens for sample in reply.samples] == [leaves[name].token_ids for name in expected_leaf_names]
 
 
 async def test_picker_orders_by_checkpoint_count_then_latest_commit(core):
@@ -791,7 +909,6 @@ async def test_picker_orders_by_checkpoint_count_then_latest_commit(core):
         [200, 201, 202, 203, 204, 205, 206],
         completion_span=(4, 7),
     )
-    state.active_leaf = shallow_late
 
     status, payload = await _collect_via_op(core, sid)
     assert status == 200
@@ -850,7 +967,7 @@ def _build_core_with_hooks(use_addition_r3: bool = False, **hook_args) -> Sessio
     return SessionCoreV2(_UnusedBackend(), registry, args, args.instance_id, use_addition_r3=use_addition_r3)
 
 
-async def _retry_shaped_session(core):
+async def _rolled_back_session(core):
     sid, state = await _fresh_state(core)
     root = _fabricate_node(
         state, None, _single_turn_record([1, 2, 3], [10, 11]), [1, 2, 3, 10, 11], completion_span=(3, 5)
@@ -862,44 +979,43 @@ async def _retry_shaped_session(core):
         [1, 2, 3, 10, 11, 20, 30],
         completion_span=(6, 7),
     )
-    retry = _fabricate_node(
+    _fabricate_node(
         state,
         root,
         _single_turn_record([1, 2, 3, 10, 11, 21], [31]),
         [1, 2, 3, 10, 11, 21, 31],
         completion_span=(6, 7),
     )
-    state.active_leaf = retry
     return sid
 
 
 async def test_custom_picker_keeps_abandoned_leaf(core):
-    """A tree-RL style picker keeps everything: the abandoned retry leaf
+    """A tree-RL style picker keeps everything: the rolled-back leaf
     becomes a second sample instead of being trimmed."""
     with function_registry.temporary("test_hooks.keep_all", _keep_all_picker):
         hooked = _build_core_with_hooks(session_sample_picker_path="test_hooks.keep_all")
-        sid = await _retry_shaped_session(hooked)
+        sid = await _rolled_back_session(hooked)
         response = await hooked.collect_samples(sid, max_seq_len=None)
         assert response.status_code == 200
         reply = decode_samples_and_merge_input_sample(bytes(response.body), Sample(), fields=COMPUTED_FIELDS_V2)
-        abandoned, retry = reply.samples
+        abandoned, replacement = reply.samples
         assert abandoned.tokens == [1, 2, 3, 10, 11, 20, 30]
-        assert retry.tokens == [1, 2, 3, 10, 11, 21, 31]
+        assert replacement.tokens == [1, 2, 3, 10, 11, 21, 31]
         # Exactly-once over the SURVIVING set: the abandoned (earlier) leaf now
-        # owns the shared root completion; the retry masks it.
+        # owns the shared root completion; the replacement masks it.
         assert abandoned.loss_mask[:2] == [1, 1]
-        assert retry.loss_mask[:2] == [0, 0]
+        assert replacement.loss_mask[:2] == [0, 0]
 
 
 async def test_custom_picker_reorder_keeps_earliest_leaf_as_owner(core):
     with function_registry.temporary("test_hooks.reverse", _reverse_picker):
         hooked = _build_core_with_hooks(session_sample_picker_path="test_hooks.reverse")
-        sid = await _retry_shaped_session(hooked)
+        sid = await _rolled_back_session(hooked)
         response = await hooked.collect_samples(sid, max_seq_len=None)
         assert response.status_code == 200
         reply = decode_samples_and_merge_input_sample(bytes(response.body), Sample(), fields=COMPUTED_FIELDS_V2)
-        retry, abandoned = reply.samples
-        assert retry.loss_mask[:2] == [0, 0]
+        replacement, abandoned = reply.samples
+        assert replacement.loss_mask[:2] == [0, 0]
         assert abandoned.loss_mask[:2] == [1, 1]
 
 
@@ -909,7 +1025,7 @@ async def test_custom_postprocessor_cannot_replace_session_rollout_metrics():
             sglang_speculative_algorithm="EAGLE",
             session_sample_postprocessor_path="test_hooks.replace_metrics",
         )
-        sid = await _retry_shaped_session(hooked)
+        sid = await _rolled_back_session(hooked)
         response = await hooked.collect_samples(sid, max_seq_len=None)
         assert response.status_code == 200
         payload = bytes(response.body)
@@ -923,7 +1039,7 @@ async def test_custom_postprocessor_cannot_replace_session_rollout_metrics():
 async def test_hook_exception_maps_to_422_with_identity(core):
     with function_registry.temporary("test_hooks.exploding", _exploding_picker):
         hooked = _build_core_with_hooks(session_sample_picker_path="test_hooks.exploding")
-        sid = await _retry_shaped_session(hooked)
+        sid = await _rolled_back_session(hooked)
         response = await hooked.collect_samples(sid, max_seq_len=None)
         assert response.status_code == 422
         body = bytes(response.body).decode()
@@ -933,7 +1049,7 @@ async def test_hook_exception_maps_to_422_with_identity(core):
 async def test_impure_picker_maps_to_422(core):
     with function_registry.temporary("test_hooks.impure", _impure_picker):
         hooked = _build_core_with_hooks(session_sample_picker_path="test_hooks.impure")
-        sid = await _retry_shaped_session(hooked)
+        sid = await _rolled_back_session(hooked)
         response = await hooked.collect_samples(sid, max_seq_len=None)
         assert response.status_code == 422
         assert "subset" in bytes(response.body).decode()
@@ -942,7 +1058,7 @@ async def test_impure_picker_maps_to_422(core):
 async def test_duplicate_picker_maps_to_422(core):
     with function_registry.temporary("test_hooks.duplicate", _duplicate_picker):
         hooked = _build_core_with_hooks(session_sample_picker_path="test_hooks.duplicate")
-        sid = await _retry_shaped_session(hooked)
+        sid = await _rolled_back_session(hooked)
         response = await hooked.collect_samples(sid, max_seq_len=None)
         assert response.status_code == 422
         assert "duplicates" in bytes(response.body).decode()
@@ -952,12 +1068,32 @@ def _exploding_postprocessor(picked_samples, session_metadata):
     raise RuntimeError("postprocess bug")
 
 
+def _clear_session_mismatch(picked_samples, session_metadata):
+    session_metadata["tito_session_mismatch"].clear()
+    return picked_samples
+
+
+async def test_postprocessor_editing_session_mismatch_keeps_the_latest_sample_mismatch(monkeypatch):
+    """The latest leaf reuses the session's mismatch; a hook editing the session's must not change the sample's."""
+    with function_registry.temporary("test_hooks.clear_mismatch", _clear_session_mismatch):
+        hooked = _build_core_with_hooks(session_sample_postprocessor_path="test_hooks.clear_mismatch")
+        monkeypatch.setattr(hooked.registry, "compute_mismatch", lambda *args, **kwargs: [{"type": "planted"}])
+        sid = await _rolled_back_session(hooked)
+
+        response = await hooked.collect_samples(sid, max_seq_len=None)
+
+        assert response.status_code == 200
+        reply = decode_samples_and_merge_input_sample(bytes(response.body), Sample(), fields=COMPUTED_FIELDS_V2)
+        (sample,) = reply.samples
+        assert sample.metadata["tito_session_mismatch"] == [{"type": "planted"}]
+
+
 class TestConfiguredPostprocessor:
     async def test_configured_postprocessor_failure_maps_to_422_with_identity(self):
         """A configured postprocessor is loaded and invoked, and its failure is a 422 naming that postprocessor."""
         with function_registry.temporary("test_hooks.exploding_postprocessor", _exploding_postprocessor):
             hooked = _build_core_with_hooks(session_sample_postprocessor_path="test_hooks.exploding_postprocessor")
-            sid = await _retry_shaped_session(hooked)
+            sid = await _rolled_back_session(hooked)
 
             response = await hooked.collect_samples(sid, max_seq_len=None)
 
@@ -978,6 +1114,26 @@ async def test_agent_cannot_fill_missing_server_metadata(core, monkeypatch):
     reply = decode_samples_and_merge_input_sample(payload, Sample(), fields=COMPUTED_FIELDS_V2)
     (sample,) = reply.samples
     assert "tito_session_mismatch" not in sample.metadata
+
+
+@pytest.mark.parametrize("turn_args", [{}, {"temperature": 0.7, "chat_template_kwargs": {"enable_thinking": False}}])
+async def test_agent_cannot_override_turn_args(core, turn_args):
+    sid = await _make_session(core, _two_turn_records(), _ACCUMULATED)
+    leaf = core.registry.sessions[sid].tree.leaves()[0]
+    leaf.turn_args = deepcopy(turn_args)
+    agent_metadata = {
+        "turn_args": {"temperature": 1.0, "messages": [{"role": "user", "content": "agent-plant"}]},
+        "agent_only": "kept",
+    }
+
+    status, payload = await _collect_via_op(core, sid, agent_metadata=agent_metadata)
+    assert status == 200
+    reply = decode_samples_and_merge_input_sample(payload, Sample(), fields=COMPUTED_FIELDS_V2)
+    (sample,) = reply.samples
+    assert sample.metadata["turn_args"] == turn_args
+    assert sample.metadata["agent_only"] == "kept"
+    assert reply.session_metadata["agent"] == agent_metadata
+    assert leaf.turn_args == turn_args
 
 
 def test_async_hook_rejected_at_load():
@@ -1013,3 +1169,58 @@ def test_samples_route_registered_before_catch_all_proxy(app_client):
     assert response.headers["content-type"] == "application/octet-stream"
     reply = decode_samples_and_merge_input_sample(response.content, Sample(), fields=COMPUTED_FIELDS_V2)
     assert reply.empty_reason == "no_records", "catch-all session_proxy swallowed the samples route"
+
+
+@pytest.mark.asyncio
+async def test_hooks_cannot_mutate_committed_state():
+    def mutate_metadata(samples, metadata):
+        metadata["accumulated_token_ids"].append(-1)
+        metadata["turn_args"]["chat_template_kwargs"]["nested"].append("session-hook")
+        for node in metadata["tree"]["nodes"]:
+            node["turn_args"]["chat_template_kwargs"]["nested"].append("tree-hook")
+        for sample in samples:
+            sample.metadata["turn_args"]["chat_template_kwargs"]["nested"].append("sample-hook")
+        return samples
+
+    with function_registry.temporary("test_hooks.mutate_turn_args", mutate_metadata):
+        hooked = _build_core_with_hooks(session_sample_picker_path="test_hooks.mutate_turn_args")
+        sid = await _rolled_back_session(hooked)
+        nodes = hooked.registry.sessions[sid].tree.nodes
+        for node in nodes:
+            node.turn_args = {"temperature": 0.7, "chat_template_kwargs": {"nested": [node.seq]}}
+        before = [deepcopy(node.turn_args) for node in nodes]
+        tokens_before = [list(node.token_ids) for node in nodes]
+        response = await hooked.collect_samples(sid, max_seq_len=None)
+        assert response.status_code == 200, response.body
+        assert [node.turn_args for node in nodes] == before
+        assert [node.token_ids for node in nodes] == tokens_before
+
+
+@pytest.mark.asyncio
+async def test_metadata_omits_payloads_without_changing_stored_turn_args(core):
+    sid = await _rolled_back_session(core)
+    nodes = core.registry.sessions[sid].tree.nodes
+    expected = []
+    for node in nodes:
+        args = {"temperature": 0.7, "chat_template_kwargs": {"nested": [node.seq]}}
+        expected.append(deepcopy(args))
+        node.turn_args = {
+            **args,
+            "input_ids": list(node.record.request["input_ids"]),
+            "messages": node.path_messages(),
+        }
+    before = [deepcopy(node.turn_args) for node in nodes]
+
+    response = await core.get_session(sid)
+    metadata = json.loads(response.body)["metadata"]
+    assert metadata["turn_args"] == expected[-1]
+    assert [node["turn_args"] for node in metadata["tree"]["nodes"]] == expected
+
+    status, payload = await _collect_via_op(core, sid)
+    assert status == 200
+    reply = decode_samples_and_merge_input_sample(payload, Sample(), fields=COMPUTED_FIELDS_V2)
+    assert reply.session_metadata == metadata
+    assert reply.samples
+    for sample in reply.samples:
+        assert sample.metadata["turn_args"] == expected[sample.metadata["leaf"]["node_id"]]
+    assert [node.turn_args for node in nodes] == before

@@ -1,16 +1,22 @@
-import dataclasses
+import functools
 import ipaddress
 import logging
 import os
 import shlex
-import sys
 
 from sglang.srt.server_args import ServerArgs
 
-from miles.backends.megatron_utils.lora_utils import convert_target_modules_to_hf, sglang_lora_target_all_sentinel
+from miles.backends.sglang_utils.arguments import sglang_attention_dp_enabled
 from miles.backends.sglang_utils.server_args_utils import server_args_to_argv
-from miles.utils.lora import LORA_ADAPTER_NAME, lora_base_cpu_backup_enabled, lora_rollout_enabled
-from miles.utils.multi_lora import is_multi_lora_enabled
+from miles.backends.sglang_utils.sglang_api_client import WorkerType
+from miles.utils.lora.utils import (
+    LORA_ADAPTER_NAME,
+    engine_loads_adapter_from_disk,
+    is_multi_lora_enabled,
+    lora_base_cpu_backup_enabled,
+    lora_rollout_enabled,
+)
+from miles.utils.workers.argv_utils import _record_field_names
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +39,9 @@ def build_server_url(host: str, port: int) -> str:
 def compute_engine_launch_cmd(
     args,
     *,
+    interpreter_prefix: list[str],
     node_rank: int,
-    worker_type: str,
+    worker_type: WorkerType,
     base_gpu_id: int,
     sglang_overrides: dict,
     num_gpus_per_engine: int,
@@ -47,6 +54,8 @@ def compute_engine_launch_cmd(
     gated_launch_port: int,
     random_seed: int,
 ) -> str:
+    _assert_launch_gate_served()
+
     server_args_dict = _compute_server_args(
         args,
         node_rank=node_rank,
@@ -65,7 +74,7 @@ def compute_engine_launch_cmd(
     )
 
     launch_args = {**server_args_dict, "host": server_args_dict["host"].strip("[]")}
-    return shlex.join([sys.executable, "-m", "sglang.launch_server", *server_args_to_argv(launch_args)])
+    return shlex.join([*interpreter_prefix, "-m", "sglang.launch_server", *server_args_to_argv(launch_args)])
 
 
 def _compute_server_args(
@@ -76,7 +85,7 @@ def _compute_server_args(
     nccl_port,
     host,
     port,
-    worker_type: str = "regular",
+    worker_type: WorkerType = WorkerType.REGULAR,
     disaggregation_bootstrap_port: int | None,
     base_gpu_id: int,
     engine_info_bootstrap_port: int | None,
@@ -85,6 +94,7 @@ def _compute_server_args(
     gated_launch_port: int,
     random_seed: int,
 ):
+    base_args = args.sglang.base_args
     _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
     nnodes = max(1, _gpus_per_engine // args.num_gpus_per_node)
     kwargs = {
@@ -105,9 +115,9 @@ def _compute_server_args(
         "gated_launch_port": gated_launch_port,
         # parallel
         "tp_size": _gpus_per_engine,
-        "dp_size": args.sglang_dp_size,
-        "pp_size": args.sglang_pp_size,
-        "ep_size": args.sglang_ep_size,
+        "dp_size": base_args["dp_size"],
+        "pp_size": base_args["pp_size"],
+        "ep_size": base_args["ep_size"],
         # always skip warmup to prevent warmup timeout.
         "skip_server_warmup": True,
         # always enable draft weights cpu backup so that we run training without mtp weights.
@@ -119,44 +129,54 @@ def _compute_server_args(
     if os.environ.get("MILES_SGLANG_DUMMY_LOAD") == "1":
         kwargs["load_format"] = "dummy"
 
-    if worker_type == "prefill":
-        kwargs["disaggregation_mode"] = "prefill"
+    if worker_type == WorkerType.PREFILL:
+        kwargs["disaggregation_mode"] = WorkerType.PREFILL.value
         kwargs.setdefault("load_balance_method", "round_robin")
         assert (
             disaggregation_bootstrap_port is not None
         ), "disaggregation_bootstrap_port must be set for prefill worker"
         kwargs["disaggregation_bootstrap_port"] = disaggregation_bootstrap_port
-    elif worker_type == "decode":
-        kwargs["disaggregation_mode"] = "decode"
+    elif worker_type == WorkerType.DECODE:
+        kwargs["disaggregation_mode"] = WorkerType.DECODE.value
         kwargs["prefill_round_robin_balance"] = True
 
     if args.use_rollout_routing_replay:
         kwargs["enable_return_routed_experts"] = True
     if args.use_rollout_indexer_replay:
         kwargs["enable_return_indexer_topk"] = True
-    if args.fp16:
-        kwargs["dtype"] = "float16"
     if engine_info_bootstrap_port is not None:
         kwargs["engine_info_bootstrap_port"] = engine_info_bootstrap_port
 
     if is_multi_lora_enabled(args):
         kwargs["enable_lora"] = True
         kwargs["max_loras_per_batch"] = args.multi_lora_n_adapters
-        kwargs["max_lora_rank"] = max(getattr(args, "lora_rank", 0), 1)
-        kwargs["lora_target_modules"] = convert_target_modules_to_hf(args.target_modules)
+        kwargs["max_lora_rank"] = max(args.lora_rank, 1)
+        kwargs["lora_target_modules"] = (
+            ["all"] if args.lora_adapter_targets == "all-linear" else args.lora_adapter_targets
+        )
     elif lora_rollout_enabled(args):
+        attention_dp = sglang_attention_dp_enabled(
+            attn_dp_size=base_args["attn_dp_size"],
+            enable_dp_attention=base_args["enable_dp_attention"],
+            dp_size=base_args["dp_size"],
+        )
         kwargs["enable_lora"] = True
-        kwargs["max_loras_per_batch"] = 1
-        kwargs["max_lora_rank"] = max(getattr(args, "lora_rank", 0), 1)
-        if sglang_lora_target_all_sentinel(args):
-            kwargs["lora_target_modules"] = ["all"]
-        else:
-            kwargs["lora_target_modules"] = convert_target_modules_to_hf(args.target_modules)
+        # attention DP serves only pinned adapters (sgl-project/sglang#36389), and SGLang never pins the last slot
+        kwargs["max_loras_per_batch"] = 2 if attention_dp else 1
+        kwargs["max_lora_rank"] = max(args.lora_rank, 1)
+        kwargs["lora_target_modules"] = (
+            ["all"] if args.lora_adapter_targets == "all-linear" else args.lora_adapter_targets
+        )
 
-        if args.lora_adapter_path is not None and kwargs.get("load_format") != "dummy":
-            kwargs["lora_paths"] = [f"{LORA_ADAPTER_NAME}={args.lora_adapter_path}"]
+        if engine_loads_adapter_from_disk(args):
+            if attention_dp:
+                kwargs["lora_paths"] = [
+                    {"lora_name": LORA_ADAPTER_NAME, "lora_path": args.lora_adapter_path, "pinned": True}
+                ]
+            else:
+                kwargs["lora_paths"] = [f"{LORA_ADAPTER_NAME}={args.lora_adapter_path}"]
         elif args.lora_adapter_path is not None:
-            logger.info("dummy base load: skipping startup lora_paths; adapter comes via weight-sync")
+            logger.info("Skipping startup lora_paths: the trainer pushes the adapter in the first weight sync")
         else:
             logger.info("No pre-trained LoRA adapter_path provided, will use random initial weights")
 
@@ -177,12 +197,12 @@ def _compute_server_args(
         kwargs.update(sglang_overrides)
 
     unused_keys = set(kwargs.keys())
-    for attr in dataclasses.fields(ServerArgs):
-        if worker_type == "decode" and attr.name == "enable_hierarchical_cache":
+    for name in _record_field_names(ServerArgs):
+        if worker_type == WorkerType.DECODE and name == "enable_hierarchical_cache":
             continue
-        if hasattr(args, f"sglang_{attr.name}") and attr.name not in kwargs:
-            kwargs[attr.name] = getattr(args, f"sglang_{attr.name}")
-        unused_keys.discard(attr.name)
+        if name in base_args and name not in kwargs:
+            kwargs[name] = base_args[name]
+        unused_keys.discard(name)
 
     # for compatibility with old args
     if len(unused_keys) > 0:
@@ -190,4 +210,22 @@ def _compute_server_args(
         for key in unused_keys:
             kwargs.pop(key)
 
+    if is_multi_lora_enabled(args):
+        assert kwargs.get("load_format") != "dummy", "Tinker engines must load the frozen base from disk"
+        if kwargs.get("max_loaded_loras") is None:
+            # use --sglang-max-loaded-loras to override
+            # TODO: dynamic allocation
+            kwargs["max_loaded_loras"] = 2 * kwargs["max_loras_per_batch"]
+
+    if kwargs.get("device") is None:
+        kwargs["device"] = "cuda"
+
     return kwargs
+
+
+@functools.cache
+def _assert_launch_gate_served() -> None:
+    assert "gated_launch_port" in _record_field_names(ServerArgs), (
+        "this sglang has no --gated-launch-port, and miles launches every inference engine through "
+        "that gate; upgrade sglang to one that serves it"
+    )

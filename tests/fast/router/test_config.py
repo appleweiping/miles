@@ -14,9 +14,6 @@ def _make_args(**overrides) -> Namespace:
         miles_router_timeout=None,
         rollout_health_check_interval=10.0,
         miles_router_health_check_failure_threshold=3,
-        sglang_server_concurrency=64,
-        rollout_num_gpus=8,
-        rollout_num_gpus_per_engine=2,
     )
     defaults.update(overrides)
     return Namespace(**defaults)
@@ -24,14 +21,14 @@ def _make_args(**overrides) -> Namespace:
 
 class TestComputeMilesRouterConfig:
     def test_explicit_max_connections_wins(self):
-        """--miles-router-max-connections overrides the derived value."""
+        """--miles-router-max-connections is the router client's connection cap."""
         config = compute_miles_router_config(_make_args(miles_router_max_connections=42), host="10.0.0.1", port=1234)
         assert config.max_connections == 42
 
-    def test_max_connections_derived_from_engine_capacity(self):
-        """Without an override, capacity is concurrency * num engines."""
+    def test_max_connections_unset_leaves_the_client_uncapped(self):
+        """Without the flag the cap is None, not derived from an engine count that changes under elastic scaling."""
         config = compute_miles_router_config(_make_args(), host="10.0.0.1", port=1234)
-        assert config.max_connections == 64 * 8 // 2
+        assert config.max_connections is None
 
     def test_remaining_fields_are_copied_from_args(self):
         """Host, port, timeout, and health check settings map one-to-one."""

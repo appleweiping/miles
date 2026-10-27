@@ -1,17 +1,12 @@
 from tests.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(
-    est_time=60,
-    suite="stage-c-8-gpu-b200",
-    labels=["precision"],
-    hardware=["blackwell"],
-)
+register_cuda_ci(est_time=60, suite="stage-c-4-gpu-b200", labels=["precision"], hardware=["blackwell"], num_gpus=2)
 
 
 import json
 import os
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import safetensors
@@ -21,6 +16,7 @@ import transformer_engine.pytorch as te
 from tools.convert_hf_to_nvfp4 import convert_nvfp4
 from tools.convert_hf_to_nvfp4 import quantize_nvfp4 as tool_quantize_nvfp4
 from tools.convert_hf_to_nvfp4 import should_quantize as tool_should_quantize_nvfp4
+from torch.utils._python_dispatch import TorchDispatchMode
 from transformer_engine.pytorch.custom_recipes.quantization_ref_nvfp4 import NVFP4QuantizerRef
 
 import miles.utils.nvfp4_fake_qat as nvfp4_qat
@@ -28,7 +24,7 @@ from miles.backends.megatron_utils.megatron_to_hf.processors.quantizer_nvfp4 imp
     quantize_nvfp4 as processor_quantize_nvfp4,
 )
 from miles.backends.megatron_utils.megatron_to_hf.processors.quantizer_nvfp4 import quantize_params_nvfp4
-from miles.utils.fused_nvfp4_qdq import (
+from miles.kernels.quant.nvfp4_qdq import (
     NVFP4QDQConfig,
     NVFP4QDQErrorMode,
     compute_nvfp4_amax,
@@ -39,6 +35,7 @@ from miles.utils.fused_nvfp4_qdq import (
 from miles.utils.nvfp4 import (
     NVFP4_GROUP_SIZE,
     nvfp4_global_decode_scale_te,
+    nvfp4_global_encode_scale_te,
     nvfp4_quantize_1d_pair,
     nvfp4_weight_e4m3_max,
 )
@@ -101,11 +98,65 @@ def _te_nvfp4_reference(
     return qweight, block_scale, nvfp4_global_decode_scale_te(global_amax, nvfp4_e4m3_max)
 
 
+class _NoHostScalarRead(TorchDispatchMode):
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        assert func != torch.ops.aten._local_scalar_dense.default, "Scale conversion read a device scalar"
+        assert func != torch.ops.aten.lift_fresh.default, "Scale conversion created a host scalar tensor"
+        return func(*args, **(kwargs or {}))
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("e4m3_max", [256, 448])
+@pytest.mark.parametrize("shape", [(), (1,), (8,), (2, 4)])
+def test_nvfp4_global_scale_exact_without_host_scalar_read(device, e4m3_max, shape):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    # Includes overflow clamping, underflow-to-zero repair and NaN propagation.
+    values = torch.tensor(
+        [
+            0.0,
+            1.0,
+            3.5,
+            torch.finfo(torch.float32).tiny,
+            torch.finfo(torch.float32).max,
+            float("inf"),
+            -float("inf"),
+            float("nan"),
+        ],
+        dtype=torch.float32,
+    )
+    # Frozen legacy batched arithmetic on CPU, independent of the device helper.
+    numerator = torch.tensor(float(e4m3_max), dtype=torch.float32) * torch.tensor(6.0, dtype=torch.float32)
+    expected = torch.div(numerator, values)
+    expected = torch.min(expected, torch.tensor(torch.finfo(torch.float32).max))
+    expected = torch.where(expected == 0.0, torch.ones_like(expected), expected)
+
+    case_size = torch.Size(shape).numel()
+    for cpu_amax, expected_encode in zip(values.split(case_size), expected.split(case_size), strict=True):
+        amax = cpu_amax.reshape(shape).to(device)
+        expected_encode = expected_encode.reshape(shape)
+        with _NoHostScalarRead():
+            encoded = nvfp4_global_encode_scale_te(amax, e4m3_max)
+            decoded = nvfp4_global_decode_scale_te(amax, e4m3_max)
+        assert encoded.device == amax.device and encoded.shape == amax.shape
+        torch.testing.assert_close(encoded.cpu(), expected_encode, rtol=0, atol=0, equal_nan=True)
+        torch.testing.assert_close(decoded.cpu(), torch.div(1.0, expected_encode), rtol=0, atol=0, equal_nan=True)
+
+
+def _quantizer_args(
+    *, extra_high_precision_layers_megatron: tuple[str, ...] | None = None, **backend_fields: object
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        backend=SimpleNamespace(**backend_fields),
+        extra_high_precision_layers_megatron=extra_high_precision_layers_megatron,
+    )
+
+
 def test_nvfp4_quantize_params_requires_complete_gated_pair():
     weight = torch.randn((4, NVFP4_GROUP_SIZE), dtype=torch.float32)
     with pytest.raises(ValueError, match="requires gate/up tensors to be quantized together"):
         quantize_params_nvfp4(
-            args=None,
+            args=_quantizer_args(),
             megatron_name="decoder.layers.0.mlp.experts.linear_fc1.weight0",
             converted_named_params=[
                 ("model.layers.0.mlp.experts.0.gate_proj.weight", weight),
@@ -120,7 +171,7 @@ def test_nvfp4_quantize_params_respects_extra_high_precision_layers_megatron():
         ("model.layers.0.mlp.experts.0.gate_proj.weight", weight),
         ("model.layers.0.mlp.experts.0.up_proj.weight", weight),
     ]
-    args = type("Args", (), {"extra_high_precision_layers_megatron": ("linear_fc1",)})()
+    args = _quantizer_args(extra_high_precision_layers_megatron=("linear_fc1",))
 
     out = quantize_params_nvfp4(
         args=args,
@@ -139,16 +190,12 @@ def test_nvfp4_quantize_params_respects_first_last_layers_bf16(layer_idx):
         ("model.layers.0.mlp.experts.0.gate_proj.weight", weight),
         ("model.layers.0.mlp.experts.0.up_proj.weight", weight),
     ]
-    args = type(
-        "Args",
-        (),
-        {
-            "first_last_layers_bf16": True,
-            "num_layers": 4,
-            "num_layers_at_start_in_bf16": 1,
-            "num_layers_at_end_in_bf16": 1,
-        },
-    )()
+    args = _quantizer_args(
+        first_last_layers_bf16=True,
+        num_layers=4,
+        num_layers_at_start_in_bf16=1,
+        num_layers_at_end_in_bf16=1,
+    )
 
     out = quantize_params_nvfp4(
         args=args,
@@ -175,7 +222,7 @@ def test_nvfp4_quantize_params_omits_static_input_scale(monkeypatch):
     )
 
     out = quantize_params_nvfp4(
-        args=None,
+        args=_quantizer_args(),
         megatron_name="decoder.layers.0.mlp.experts.linear_fc1.weight0",
         converted_named_params=[
             ("model.layers.0.mlp.experts.0.gate_proj.weight", weight),
@@ -755,7 +802,7 @@ class TestNVFP4FakeQATAdapter:
         qdq_config = object()
         config_calls = 0
         calls = []
-        fake_module = ModuleType("miles.utils.fused_nvfp4_qdq")
+        fake_module = ModuleType("miles.kernels.quant.nvfp4_qdq")
 
         def current_config():
             nonlocal config_calls
@@ -768,7 +815,7 @@ class TestNVFP4FakeQATAdapter:
 
         fake_module.current_nvfp4_qdq_config = current_config
         fake_module.fake_nvfp4_quantization_ste = fake_qdq
-        monkeypatch.setitem(sys.modules, "miles.utils.fused_nvfp4_qdq", fake_module)
+        monkeypatch.setitem(sys.modules, "miles.kernels.quant.nvfp4_qdq", fake_module)
         monkeypatch.setenv(nvfp4_qat.NVFP4_FAKE_QAT_FLAG, "1")
 
         actual = nvfp4_qat.maybe_fake_quantize_nvfp4_weight_tensors(weights)

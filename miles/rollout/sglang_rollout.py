@@ -16,17 +16,22 @@ from tqdm import tqdm
 from miles.rollout.base_types import GenerateFnInput, RolloutFnEvalOutput, RolloutFnTrainOutput
 from miles.rollout.filter_hub.base_types import MetricGatherer
 from miles.rollout.filter_hub.common_filters import apply_preput_filters
+from miles.rollout.generate_utils.rollout_topk_logprobs import (
+    append_rollout_topk_logprobs,
+    configure_rollout_topk_logprobs_request,
+)
 from miles.rollout.inference_rollout.compatibility import load_generate_function
+from miles.rollout.inference_rollout.inference_rollout_common import stamp_sample_lineage
 from miles.utils import dumper_utils
-from miles.utils.async_utils import run
+from miles.utils.async_utils import DynamicLimitSemaphore, run
+from miles.utils.audit_utils.sample_ownership.recorder import SampleOwnershipRecorder
 from miles.utils.data import Dataset
 from miles.utils.eval_config import EvalDatasetConfig
 from miles.utils.function_registry import load_function
 from miles.utils.http_utils import get, post, router_worker_base_urls
 from miles.utils.lifecycle import TrajectoryLifecycle
-from miles.utils.lora import LORA_ADAPTER_NAME, lora_rollout_enabled
+from miles.utils.lora.utils import LORA_ADAPTER_NAME, lora_rollout_enabled
 from miles.utils.misc import SingletonMeta, call_agent_abort_hook
-from miles.utils.multi_lora import make_rid, slot_lora_name
 from miles.utils.processing_utils import (
     call_processor,
     encode_image_for_rollout_engine,
@@ -43,6 +48,7 @@ from .generate_utils.generate_endpoint_utils import (
 )
 from .generate_utils.prefill_logprobs import recompute_samples_rollout_logprobs_via_prefill
 from .generate_utils.sample_utils import reward_log_summary, sample_text_preview
+from .generate_utils.sampling_mask import append_sampling_metadata, should_return_sampling_mask
 from .rm_hub import async_rm, batched_async_rm
 
 __all__ = ["generate_rollout", "get_model_url"]
@@ -62,7 +68,7 @@ def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate")
     Falls back to the default router if *model_name* is not found or
     ``sglang_model_routers`` is not set.
     """
-    routers = getattr(args, "sglang_model_routers", None)
+    routers = args.sglang_model_routers
     if routers and model_name in routers:
         ip, port = routers[model_name]
         return f"http://{ip}:{port}{endpoint}"
@@ -82,8 +88,8 @@ class GenerateState(metaclass=SingletonMeta):
         )
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
 
-        self.semaphore = asyncio.Semaphore(
-            args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+        self.semaphore = DynamicLimitSemaphore(
+            lambda: args.sglang_server_concurrency * max(args.inference_runtime_mut_state.engine_count, 1)
         )
         self.sampling_params: dict[str, Any] = dict(
             temperature=args.rollout_temperature,
@@ -97,15 +103,19 @@ class GenerateState(metaclass=SingletonMeta):
             spaces_between_special_tokens=False,
         )
 
-        if getattr(args, "sglang_enable_deterministic_inference", False):
+        if args.sglang.common_value("enable_deterministic_inference"):
             sampling_seed_base = args.rollout_seed
             self.group_sampling_seeds = [sampling_seed_base + i for i in range(args.n_samples_per_prompt)]
 
         # dp rank balancing
-        self.dp_counts = [0] * (args.sglang_dp_size or 1)
+        self.dp_counts = [0] * (args.sglang.common_value("dp_size") or 1)
         self.dp_rank = 0
 
         self.reset()
+
+    @classmethod
+    def _validate_reuse(cls, instance: "GenerateState", args: Namespace) -> None:
+        assert instance.args == args
 
     @contextmanager
     def dp_rank_context(self):
@@ -140,7 +150,13 @@ class GenerateState(metaclass=SingletonMeta):
         self.remaining_batch_size += len(samples)
 
 
-async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
+async def generate(
+    args: Namespace,
+    sample: Sample,
+    sampling_params: dict[str, Any],
+    *,
+    evaluation: bool = False,
+) -> Sample:
     """Generate using traditional SGLang router with token-based workflow"""
     if args.ci_test:
         assert isinstance(sample.prompt, str)
@@ -158,7 +174,9 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     ):
         processor_output = call_processor(state.processor, sample.prompt, sample.multimodal_inputs)
         prompt_ids = processor_output["input_ids"][0]
-        prompt_ids = prompt_ids.tolist() if hasattr(prompt_ids, "tolist") else list(prompt_ids)
+        prompt_ids = (
+            prompt_ids.tolist() if hasattr(prompt_ids, "tolist") else list(prompt_ids)
+        )  # config-access-exempt: tokenizers may return tensors, arrays, or Python lists
         sample.multimodal_train_inputs = extract_multimodal_train_inputs(processor_output)
     else:
         prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
@@ -173,37 +191,30 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         sample.status = Sample.Status.TRUNCATED
         return sample
 
+    return_sampling_mask = should_return_sampling_mask(args, sampling_params, evaluation=evaluation)
+
     # Prepare payload for sglang server
     payload = {
         "sampling_params": sampling_params,
         "return_logprob": True,
     }
-    opd_top_k = getattr(args, "opd_log_prob_top_k", 0) or 0
-    opd_top_k_strategy = getattr(args, "opd_top_k_strategy", "only-student")
-    if getattr(args, "use_opd", False) and opd_top_k > 0 and opd_top_k_strategy != "only-teacher":
+    if return_sampling_mask:
+        payload["return_sampling_mask"] = True
+    opd_top_k = args.opd_log_prob_top_k or 0
+    opd_top_k_strategy = args.opd_top_k_strategy
+    if args.use_opd and opd_top_k > 0 and opd_top_k_strategy != "only-teacher":
         payload["top_logprobs_num"] = opd_top_k
+    if not evaluation:
+        configure_rollout_topk_logprobs_request(args, payload)
 
-    if sample.adapter is not None:
-        from miles.ray.multi_lora.controller import AdaptersCache
-
-        if (adapter := await AdaptersCache().get(sample.adapter.name)) is None:
-            # Adapter deregistered: don't POST, or an orphan the abort round can't see
-            # would keep decoding under the slot's next tenant and pollute its group.
-            logger.warning(
-                f"Dropping generation for adapter '{sample.adapter.name}' (slot {sample.adapter.slot}): "
-                "adapter is no longer sampleable"
-            )
-            sample.status = Sample.Status.ABORTED
-            return sample
-        payload["lora_path"] = slot_lora_name(sample.adapter.slot)
-        payload["rid"] = make_rid(sample.adapter.name)
-        payload["extra_key"] = f"{sample.adapter.name}:v{adapter.version}"
-    elif lora_rollout_enabled(args):
+    if (extra_key := sample.kv_cache_namespace) is not None:
+        payload["extra_key"] = extra_key
+    if lora_rollout_enabled(args):
         payload["lora_path"] = LORA_ADAPTER_NAME
 
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
-    if getattr(args, "use_rollout_indexer_replay", False):
+    if args.use_rollout_indexer_replay:
         payload["return_indexer_topk"] = True
 
     if sample.multimodal_inputs and sample.multimodal_inputs["images"]:
@@ -228,7 +239,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     headers = compute_routing_headers(args, sample)
 
     output = await post(url, payload, headers=headers)
-    if getattr(args, "use_opd", False) and opd_top_k > 0 and opd_top_k_strategy != "only-teacher":
+    if args.use_opd and opd_top_k > 0 and opd_top_k_strategy != "only-teacher":
         output_top_logprobs = output.get("meta_info", {}).get("output_top_logprobs")
         if output_top_logprobs is not None:
             sample.metadata.setdefault("opd_student_top_logprobs", [])
@@ -240,10 +251,25 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     else:
         new_response_tokens, new_response_log_probs = [], []
 
+    if payload.get("return_sampling_mask", False):
+        new_response_log_probs = append_sampling_metadata(
+            sample,
+            new_response_tokens,
+            output["meta_info"],
+            sampling_logprobs_mode=payload.get("sampling_logprobs_mode", "selected"),
+        )
+
     # Update sample with tokens directly - avoiding re-tokenization
     sample.tokens = sample.tokens + new_response_tokens
     sample.response_length += len(new_response_tokens)
     sample.response += output["text"]
+    if not evaluation:
+        append_rollout_topk_logprobs(
+            sample,
+            output["meta_info"],
+            args.rollout_top_logprobs_num,
+            sampling_logprobs_mode=payload.get("sampling_logprobs_mode", "selected"),
+        )
 
     # When partial rollout and masking off policy is enabled, update the loss mask
     if sample.loss_mask is not None:
@@ -270,6 +296,10 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
             f"prompt_tokens={output['meta_info'].get('prompt_tokens')} response={len(new_response_tokens)} "
             f"unexpanded_tokens={len(sample.tokens)}"
         )
+        assert _re.size == 0 or _re.any(), (
+            "routed_experts payload is all zeros: the sglang engine did not capture routed experts "
+            "(topk-bypassing --moe-runner-backend such as flashinfer_trtllm?)."
+        )
         sample.rollout_routed_experts = _re.reshape(_ntok, args.num_layers, _topk)
     if "indexer_topk" in output["meta_info"]:
         sample.rollout_indexer_topk = get_indexer_topk_from_response(args, output, sample)
@@ -285,6 +315,8 @@ async def generate_and_rm(
     sampling_params: dict[str, Any],
     evaluation: bool = False,
 ) -> Sample | list[Sample]:
+    input_sample_index = sample.index
+
     # mask previous off-policy generation for partial rollout
     if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
         sample.loss_mask = [0] * sample.response_length
@@ -316,7 +348,7 @@ async def generate_and_rm(
 
         with state.dp_rank_context() as _:
             # Check sample.generate_function_path for per-sample custom_generate_function_path (e.g., from eval dataset config)
-            custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
+            custom_func_path = sample.generate_function_path or args.custom_generate_function_path
 
             generate_fn = load_generate_function(custom_func_path) if custom_func_path else None
             if generate_fn is not None:
@@ -325,7 +357,9 @@ async def generate_and_rm(
                 )
                 sample = output.samples
             else:
-                sample = await generate(args, sample, sampling_params)
+                sample = await generate(args, sample, sampling_params, evaluation=evaluation)
+            if not evaluation:
+                stamp_sample_lineage(sample, source_sample_index=input_sample_index)
 
     if sink is not None:
         sink.attempt_end(sample)
@@ -373,7 +407,7 @@ async def generate_and_rm_group(
     tasks = []
     for idx, sample in enumerate(group):
         current_sampling_params = sampling_params.copy()
-        if getattr(args, "sglang_enable_deterministic_inference", False):
+        if args.sglang.common_value("enable_deterministic_inference"):
             seed = state.group_sampling_seeds[idx]
             current_sampling_params["sampling_seed"] = seed
         tasks.append(
@@ -409,7 +443,7 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     logger.info(f"Abort request for {urls}")
     abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
     abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
-    for url, result in zip(urls, abort_results, strict=False):
+    for url, result in zip(urls, abort_results, strict=True):
         if isinstance(result, Exception):
             logger.warning(f"Failed to abort worker at {url}: {result}")
 
@@ -423,6 +457,9 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
 
         if not args.partial_rollout:
+            if args.enable_sample_ownership_checker:
+                groups = [task.result() for task in done]
+                SampleOwnershipRecorder.log_dropped_groups(args=args, before=groups, after=[], reason="aborted")
             continue
 
         # for partial rollout, collect the partial samples into the data buffer
@@ -498,9 +535,11 @@ async def generate_rollout_async(
 
             assert len(group) == args.n_samples_per_prompt
             all_data.append(group)
+            metric_gatherer.on_group_before_dynamic_filter(args, group)
             filter_output = apply_preput_filters(args, dynamic_filter, group)
             if not filter_output.keep:
                 metric_gatherer.on_dynamic_filter_drop(reason=filter_output.reason)
+                SampleOwnershipRecorder.log_dropped_groups(args=args, before=group, after=[], reason="dynamic_filter")
                 state.remaining_batch_size -= 1
                 continue
 
@@ -509,6 +548,8 @@ async def generate_rollout_async(
             if len(data) < target_data_size:
                 data.append(group)
                 pbar.update(args.n_samples_per_prompt)
+            else:
+                SampleOwnershipRecorder.log_dropped_groups(args=args, before=group, after=[], reason="oversampling")
 
     pbar.close()
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
@@ -530,9 +571,13 @@ async def generate_rollout_async(
 
     # reset the global state to prevent effects on the next rollout or eval.
     state.reset()
+    before_filter = SampleOwnershipRecorder.flatten_samples(data)
     if (x := args.rollout_sample_filter_path) is not None:
         filter_func = load_function(x)
         filter_func(args, data)
+    SampleOwnershipRecorder.log_dropped_groups(
+        args=args, before=before_filter, after=data, reason="rollout_sample_filter"
+    )
 
     # There can be circumstances where users want to process all samples including filtered ones.
     if (x := args.rollout_all_samples_process_path) is not None:
@@ -556,7 +601,7 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict
     assert not args.group_rm, "Group RM is not supported for eval rollout"
 
     coros = []
-    for dataset_cfg in getattr(args, "eval_datasets", []) or []:
+    for dataset_cfg in args.eval_datasets or []:
         coros.append(eval_rollout_single_dataset(args, rollout_id, dataset_cfg))
     results_list = await asyncio.gather(*coros)
     results = {}
@@ -621,12 +666,12 @@ async def eval_rollout_single_dataset(
             sample = copy.deepcopy(prompt_sample)
             sample.index = sample_index
             sample_index += 1
-            sample.metadata = dataset_cfg.inject_metadata(getattr(sample, "metadata", None))
-            sample.generate_function_path = getattr(dataset_cfg, "custom_generate_function_path", None)
+            sample.metadata = dataset_cfg.inject_metadata(sample.metadata)
+            sample.generate_function_path = x.path if (x := dataset_cfg.custom_generate_function_path) else None
             if policy_uses_routing_key(args):
                 sample.routing_key = str(uuid.uuid4())
             sampling_params = base_sampling_params
-            if getattr(args, "sglang_enable_deterministic_inference", False):
+            if args.sglang.common_value("enable_deterministic_inference"):
                 sampling_params = base_sampling_params.copy()
                 sampling_params["sampling_seed"] = args.rollout_seed + j
             tasks.append(
@@ -692,5 +737,6 @@ def generate_rollout(
         return output
 
     output, aborted_samples = run(generate_rollout_async(args, rollout_id, data_source.get_samples))
-    data_source.add_samples(aborted_samples)
+    if aborted_samples:
+        data_source.add_samples(aborted_samples)
     return output

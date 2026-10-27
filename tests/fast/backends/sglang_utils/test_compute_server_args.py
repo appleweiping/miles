@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import dataclasses
 from types import SimpleNamespace
 
+import msgspec
 import pytest
+from tests.fast.fixtures.sglang_config_fixtures import with_parser_defaults_and_sglang_config
 
+from miles.backends.sglang_utils import sglang_engine
+from miles.backends.sglang_utils.sglang_api_client import WorkerType
 from miles.backends.sglang_utils.sglang_engine import _compute_server_args
 
 
@@ -15,6 +20,8 @@ def make_args(**overrides: object) -> SimpleNamespace:
         rollout_num_gpus_per_engine=1,
         offload_rollout=False,
         sglang_dp_size=1,
+        sglang_enable_dp_attention=False,
+        sglang_attn_dp_size=1,
         sglang_pp_size=1,
         sglang_ep_size=1,
         sglang_mem_fraction_static=0.7,
@@ -22,11 +29,14 @@ def make_args(**overrides: object) -> SimpleNamespace:
         use_rollout_indexer_replay=False,
         fp16=False,
         lora_adapter_path=None,
+        debug_rollout_only=False,
+        debug_skip_weight_update=False,
+        multi_lora=False,
         multi_lora_n_adapters=1,
-        target_modules=["linear_qkv"],
+        lora_adapter_targets=[f"model.layers.*.self_attn.{projection}_proj" for projection in ("q", "k", "v")],
     )
     defaults.update(overrides)
-    return SimpleNamespace(**defaults)
+    return SimpleNamespace(**with_parser_defaults_and_sglang_config(defaults))
 
 
 def compute(args: SimpleNamespace, **overrides: object) -> dict:
@@ -36,7 +46,7 @@ def compute(args: SimpleNamespace, **overrides: object) -> dict:
         nccl_port=5000,
         host="127.0.0.1",
         port=30000,
-        worker_type="regular",
+        worker_type=WorkerType.REGULAR,
         disaggregation_bootstrap_port=None,
         base_gpu_id=0,
         engine_info_bootstrap_port=None,
@@ -47,6 +57,22 @@ def compute(args: SimpleNamespace, **overrides: object) -> dict:
     )
     kwargs.update(overrides)
     return _compute_server_args(args, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "record_factory", [dataclasses.make_dataclass, msgspec.defstruct], ids=["dataclass", "msgspec"]
+)
+def test_server_args_representation_preserves_launch_values(monkeypatch, record_factory):
+    """Both record shapes must yield the same launch values, plus the device this renderer always pins."""
+    server_args_type = record_factory(
+        "ServerArgs",
+        [("gated_launch_port", int), ("mem_fraction_static", float), ("random_seed", int)],
+    )
+    monkeypatch.setattr(sglang_engine, "ServerArgs", server_args_type)
+
+    result = compute(make_args(), random_seed=7, sglang_overrides={"random_seed": 99, "unknown_field": True})
+
+    assert result == {"gated_launch_port": 30001, "mem_fraction_static": 0.7, "random_seed": 99, "device": "cuda"}
 
 
 class TestRandomSeed:
@@ -79,6 +105,20 @@ class TestBaseGpuId:
         server_args = compute(make_args(), base_gpu_id=7)
 
         assert server_args["base_gpu_id"] == 7
+
+
+class TestDeviceResolution:
+    def test_generic_device_arg_takes_precedence_over_the_cuda_default(self):
+        """An explicit generic device remains authoritative over the controller-safe default."""
+        server_args = compute(make_args(sglang_device="cpu"))
+
+        assert server_args["device"] == "cpu"
+
+    def test_group_device_override_takes_precedence_over_the_cuda_default(self):
+        """A per-group device override remains authoritative over the controller-safe default."""
+        server_args = compute(make_args(), sglang_overrides={"device": "xpu"})
+
+        assert server_args["device"] == "xpu"
 
 
 class TestSglangOverridePrecedence:
@@ -114,3 +154,42 @@ class TestSglangOverridePrecedence:
         assert server_args["dtype"] == "float16"
         assert server_args["enable_lora"] is True
         assert server_args["mem_fraction_static"] == 0.7
+
+
+class TestAdapterOwnership:
+    def test_a_trainer_run_leaves_the_adapter_to_the_first_weight_sync(self):
+        """An engine that also loaded the adapter from disk would serve stale weights if the sync were skipped."""
+        server_args = compute(make_args(lora_rank=8, lora_adapter_path="/fake/adapter"))
+
+        assert server_args["enable_lora"] is True
+        assert not server_args.get("lora_paths")
+
+    @pytest.mark.parametrize(
+        "flag", ["debug_rollout_only", "debug_skip_weight_update"], ids=["rollout-only", "skip-sync"]
+    )
+    def test_without_a_trainer_push_the_engine_loads_the_adapter_itself(self, flag):
+        server_args = compute(make_args(lora_rank=8, lora_adapter_path="/fake/adapter", **{flag: True}))
+
+        assert server_args["lora_paths"] == ["miles_lora=/fake/adapter"]
+
+
+_ATTENTION_DP_SPELLINGS = [
+    pytest.param(dict(sglang_attn_dp_size=8), True, id="attn-dp-size"),
+    pytest.param(dict(sglang_enable_dp_attention=True, sglang_dp_size=8), True, id="deprecated-enable-dp-attention"),
+    pytest.param(dict(sglang_enable_dp_attention=True, sglang_dp_size=1), False, id="enable-dp-attention-at-dp-1"),
+    pytest.param({}, False, id="no-attention-dp"),
+]
+
+
+class TestAttentionDpLoRA:
+    @pytest.mark.parametrize(("parallel", "attention_dp"), _ATTENTION_DP_SPELLINGS)
+    def test_attention_dp_pins_the_adapter_beside_a_base_model_slot(self, parallel, attention_dp):
+        """SGLang's attention-DP LoRA admits only pinned adapters, and never pins the slot it keeps for the base model."""
+        args = make_args(lora_rank=8, lora_adapter_path="/fake/adapter", debug_rollout_only=True, **parallel)
+        for name in ("sglang_attn_dp_size", "sglang_enable_dp_attention", "sglang_dp_size"):
+            delattr(args, name)
+        server_args = compute(args)
+
+        pinned = {"lora_name": "miles_lora", "lora_path": "/fake/adapter", "pinned": True}
+        assert server_args["lora_paths"] == [pinned if attention_dp else "miles_lora=/fake/adapter"]
+        assert server_args["max_loras_per_batch"] == (2 if attention_dp else 1)

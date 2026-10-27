@@ -7,6 +7,7 @@ The agent logic is fully encapsulated in a user-provided async function
   2. Collecting the worker-assembled training samples (the session server
      converts records to samples, truncates and merges in the owning worker)
   3. Driver-side metadata application (agent_metadata, session_metadata)
+  4. Where each agent call runs (--custom-agent-function-mode)
 
 Agent function contract:
   async def my_agent(
@@ -21,6 +22,10 @@ Agent function contract:
   Returning None means no extra metadata to attach.
   Returning a dict merges it into every sample's metadata, so downstream
   reward models (--custom-rm-path) can read whatever the agent left there.
+
+  Under ``subproc`` (the default) each call runs in a child process of its own:
+  its arguments and return value must be picklable, and module-level state lasts
+  one call. Limits shared across calls go through ``miles.rollout.agentic.rollout_limits``.
 """
 
 import argparse
@@ -33,6 +38,8 @@ from typing import Any
 import httpx
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
+from miles.dashboard.hooks import push_sandbox_reports
+from miles.rollout.agentic.agent_function import AGENT_FUNCTION_MODES, call_agent_function
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
 from miles.rollout.generate_utils.openai_endpoint_utils import OpenAIEndpointTracer
 from miles.rollout.session.v2.metrics import SESSION_ROLLOUT_METRICS_KEY
@@ -44,20 +51,27 @@ logger = logging.getLogger(__name__)
 
 async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     assert not input.args.partial_rollout, "Partial rollout is not supported"
-    assert getattr(input.args, "session_server_addrs", None), (
-        "agentic_tool_call.generate requires session_server_addrs. "
+    assert input.args.session_server_instances, (
+        "agentic_tool_call.generate requires session_server_instances. "
         "Pass --use-session-server to start the session server."
     )
-    use_v2 = getattr(input.args, "use_session_server", None) == "v2"
-    collect_spec_metrics = use_v2 and input.args.sglang_speculative_algorithm is not None
-    tracer = await OpenAIEndpointTracer.create(input.args)
+    use_v2 = input.args.use_session_server == "v2"
+    collect_spec_metrics = use_v2 and input.args.sglang.common_value("speculative_algorithm") is not None
+    tracer = await OpenAIEndpointTracer.create(
+        input.args,
+        evaluation=input.evaluation,
+        sampling_params=input.sampling_params,
+        extra_key=input.sample.kv_cache_namespace,
+    )
 
     custom_agent_function: Callable = load_function(input.args.custom_agent_function_path)
     assert (
         custom_agent_function is not None
     ), f"Custom agent function {input.args.custom_agent_function_path} not found"
 
-    max_seq_len = getattr(input.args, "max_seq_len", None)
+    max_seq_len = getattr(
+        input.args, "max_seq_len", None
+    )  # config-access-exempt: optional length limit registered by custom agent hooks
 
     metadata = input.sample.metadata
     if max_seq_len is not None:
@@ -75,8 +89,11 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     t_start = time.monotonic()
     try:
         logger.debug(f"{log_prefix} Starting agent function call")
-        agent_metadata = await custom_agent_function(
-            base_url=tracer.base_url,
+        agent_metadata = await call_agent_function(
+            custom_agent_function,
+            mode=input.args.custom_agent_function_mode,
+            on_child_reports=push_sandbox_reports,
+            base_url=tracer.agent_base_url,
             prompt=input.sample.prompt,
             request_kwargs=build_chat_request_kwargs(input.sampling_params),
             metadata=metadata,
@@ -167,7 +184,13 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
 
 
 def _add_arguments(parser: argparse.ArgumentParser):
-    parser.add_argument("--custom-agent-function-path", type=str)
+    parser.add_argument(
+        "--custom-agent-function-mode",
+        choices=AGENT_FUNCTION_MODES,
+        default="subproc",
+        help="Where each agent call runs: subproc, a child process of its own so one episode's "
+        "blocking step or crash cannot stall the others; or inline, on the rollout's event loop.",
+    )
     parser.add_argument(
         "--max-seq-len",
         type=int,

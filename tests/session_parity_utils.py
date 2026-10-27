@@ -18,12 +18,14 @@ from unittest.mock import patch
 import httpx
 import numpy as np
 from tests.fast.fixtures.session_fixtures import make_session_server_config
+from tests.fast.fixtures.sglang_config_fixtures import make_sglang_config
 
 from miles.rollout.base_types import GenerateFnInput
 from miles.rollout.generate_hub import agentic_tool_call
 from miles.rollout.generate_utils.openai_endpoint_utils import OpenAIEndpointTracer
 from miles.rollout.session.samples.codec import SamplesReply
 from miles.rollout.session.server import SessionServer
+from miles.rollout.session.types import SessionServerInstance
 from miles.utils import http_utils
 from miles.utils.http_utils import find_available_port
 from miles.utils.test_utils.uvicorn_thread_server import UvicornThreadServer
@@ -34,7 +36,7 @@ V2 = "v2"
 SESSION_PARITY_SEED = 20260803
 
 _CHAT_TIMEOUT_SECS = 120.0
-_PICKER_PATH = "miles.rollout.session.v2.picker_hub.drop_retries"
+_PICKER_PATH = "miles.rollout.session.v2.picker_hub.drop_same_prompt_retries"
 _POSTPROCESSOR_PATH = "miles.rollout.session.v2.postprocessor_hub.default_postprocess"
 _RUNTIME_LIFECYCLE_KEYS = frozenset({"t0", "t1", "req_ts", "prev_t1"})
 _EXPECTED_AGENT_METADATA = {
@@ -100,7 +102,10 @@ async def _run_and_collect(
     input_samples: list[Sample],
 ) -> list[tuple[dict[str, Any], SamplesReply, list[Sample]]]:
     async with httpx.AsyncClient(timeout=None) as client:
-        with patch.object(http_utils, "_http_client", client):
+        with (
+            patch.dict(http_utils._http_clients, {asyncio.get_running_loop(): client}),
+            patch.object(http_utils, "_client_concurrency", 1),
+        ):
             original_collect = OpenAIEndpointTracer.collect_samples
             collected: dict[int, tuple[dict[str, Any], SamplesReply]] = {}
 
@@ -238,16 +243,18 @@ def _serve_session(*, backend_url: str, hf_checkpoint: str, version: str) -> Ite
         chat_template_path=None,
         apply_chat_template_kwargs={"enable_thinking": False},
         tito_model="qwen3",
-        sglang_speculative_algorithm=None,
+        sglang=make_sglang_config(speculative_algorithm=None),
         use_session_server=version,
         use_rollout_routing_replay=False,
         use_rollout_indexer_replay=False,
+        use_sampling_support_replay=False,
+        rollout_temperature=1.0,
         pause_generation_mode="retract",
         session_server_ip="127.0.0.1",
-        session_server_addrs=[session_addr],
-        session_server_instance_ids={session_addr: instance_id},
+        session_server_instances=[SessionServerInstance(addr=session_addr, instance_id=instance_id)],
         save_debug_trajectory_data=None,
         custom_agent_function_path="miles.utils.test_utils.session_verify_agent.run_agent",
+        custom_agent_function_mode="inline",
         partial_rollout=False,
         max_seq_len=None,
         session_verify_cycles=1,

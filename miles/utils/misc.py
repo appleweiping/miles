@@ -1,8 +1,9 @@
 import asyncio
 import logging
 import os
-from collections.abc import Awaitable, Callable, Sequence
-from typing import Any
+from collections.abc import Awaitable, Callable, Iterable, Sequence
+from dataclasses import dataclass
+from typing import Any, Generic, TypeVar
 
 import ray
 
@@ -15,6 +16,40 @@ logger = logging.getLogger(__name__)
 _MIN_DYNAMIC_PORT = 20000
 _MAX_PORT = 65535
 
+_K = TypeVar("_K")
+_V = TypeVar("_V")
+_T = TypeVar("_T")
+
+
+@dataclass
+class MutableBox(Generic[_T]):
+    value: _T
+
+
+def split_evenly(total: int, num_parts: int) -> list[slice]:
+    quotient, remainder = divmod(total, num_parts)
+    slices = []
+    start = 0
+    for i in range(num_parts):
+        stop = start + quotient + (1 if i < remainder else 0)
+        slices.append(slice(start, stop))
+        start = stop
+    return slices
+
+
+def partition(xs: Iterable[_T], predicate: Callable[[_T], bool]) -> tuple[list[_T], list[_T]]:
+    falses: list[_T] = []
+    trues: list[_T] = []
+    for x in xs:
+        (trues if predicate(x) else falses).append(x)
+    return falses, trues
+
+
+def merge_asserting_consistency(a: dict[_K, _V], b: dict[_K, _V]) -> dict[_K, _V]:
+    conflicts = {key: (a[key], b[key]) for key in a.keys() & b.keys() if a[key] != b[key]}
+    assert not conflicts, f"cannot merge two dicts that disagree: {conflicts}"
+    return a | b
+
 
 async def call_agent_abort_hook(args) -> None:
     """Invoke the agent plugin's optional abort hook, if it defines one.
@@ -26,11 +61,13 @@ async def call_agent_abort_hook(args) -> None:
     sibling ``abort`` callable in the same module as the configured agent function
     and call it. Backends that don't expose one are left to drain as before.
     """
-    agent_function_path = getattr(args, "custom_agent_function_path", None)
+    from miles.utils.args.custom_view import compute_custom_function_config
+
+    agent_function_path = args.custom_agent_function_path
     if not agent_function_path:
         return
 
-    module_path, _, _ = agent_function_path.rpartition(".")
+    module_path, _, _ = agent_function_path.path.rpartition(".")
     if not module_path:
         return
     try:
@@ -39,7 +76,8 @@ async def call_agent_abort_hook(args) -> None:
         return  # plugin doesn't expose an abort hook; nothing to tear down
 
     try:
-        await abort_hook(args)
+        fn_args = compute_custom_function_config(args, agent_function_path)
+        await abort_hook(fn_args)
     except Exception as e:
         logger.warning(f"Agent abort hook {module_path}.abort failed: {e}")
 
@@ -51,10 +89,14 @@ class SingletonMeta(type):
 
     _instances = {}
 
-    def __call__(cls, *args, **kwargs):
+    def __call__(cls, *args: Any, **kwargs: Any) -> Any:
         if cls not in cls._instances:
             instance = super().__call__(*args, **kwargs)
             cls._instances[cls] = instance
+        elif (
+            validate_reuse := getattr(cls, "_validate_reuse", None)
+        ) is not None:  # config-access-exempt: optional singleton reuse protocol
+            validate_reuse(cls._instances[cls], *args, **kwargs)
         return cls._instances[cls]
 
     @staticmethod
@@ -67,6 +109,21 @@ def get_current_node_ip():
     # strip ipv6 address
     address = address.strip("[]")
     return address
+
+
+MILES_NODE_EXTERNAL_IP_ENV = "MILES_NODE_EXTERNAL_IP"
+
+
+def get_node_external_ip() -> str | None:
+    """The address off-cluster peers reach this node on (a DNS name also works),
+    or None when its own address already routes from there.
+
+    The deployment supplies this per node -- a tailscale sidecar or an init
+    container writing the interface it joined. It is never forwarded through the
+    job's runtime env, which would give every node one shared value; one host for
+    every session server is ``--session-server-external-host`` instead.
+    """
+    return os.environ.get(MILES_NODE_EXTERNAL_IP_ENV) or None
 
 
 def get_free_port(start_port=10000, consecutive=1):
@@ -121,6 +178,10 @@ class NodeProbeMixin:
         return os.getenv(MILES_HOST_IP_ENV) or get_current_node_ip()
 
     @staticmethod
+    def _get_node_external_ip() -> str | None:
+        return get_node_external_ip()
+
+    @staticmethod
     def _get_free_port_block(*, start_port: int, count: int) -> int:
         return get_free_port(start_port=start_port, consecutive=count)
 
@@ -135,12 +196,6 @@ class NodeProbeMixin:
     @staticmethod
     def _get_gpu_uuids(gpu_ids: list[int]) -> list[str | None]:
         return get_gpu_uuids(gpu_ids)
-
-    @staticmethod
-    def _collect_env_report(*, role: str, rank: int, partial_env_report: str) -> None:
-        from miles.utils.env_report import collect_and_print_node_env_report
-
-        collect_and_print_node_env_report(role=role, rank=rank, partial_env_report=partial_env_report)
 
 
 def should_run_periodic_action(
